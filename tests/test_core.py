@@ -41,6 +41,15 @@ class GitwsTests(unittest.TestCase):
             from gitws.core import ensure_clean
             ensure_clean(repo.path)
 
+    def test_size_reports_total_and_workspace(self):
+        repo = self.store.add("demo", self.source)
+        first = run_git("rev-parse", "HEAD", cwd=self.source)
+        self.store.create_workspace(repo, "a", first)
+        result = self.store.size(repo)
+        self.assertIn("total", result)
+        self.assertIn("workspace:a", result)
+        self.assertGreater(result["total"]["logical"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

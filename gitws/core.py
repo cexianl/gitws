@@ -238,14 +238,36 @@ class Store:
         run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
         record.unlink(missing_ok=True)
 
-    def size(self, repo: Repo) -> dict[str, int]:
-        def apparent(path: Path) -> int:
+    def size(self, repo: Repo) -> dict[str, dict[str, int]]:
+        def measure(path: Path, seen: set[tuple[int, int]]) -> dict[str, int]:
+            logical = 0
+            physical = 0
             if not path.exists():
-                return 0
-            return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
-        workspaces = [Path(item["path"]) for item in self.workspaces(repo.name)]
-        return {"mirror": apparent(repo.mirror), "source": apparent(repo.path),
-                **{f"workspace:{p.name}": apparent(p) for p in workspaces}}
+                return {"logical": 0, "physical": 0}
+            for root, dirs, files in os.walk(path, followlinks=False):
+                dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
+                for name in files:
+                    file_path = Path(root) / name
+                    try:
+                        stat = file_path.stat()
+                    except OSError:
+                        continue
+                    logical += stat.st_size
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity not in seen:
+                        seen.add(identity)
+                        physical += stat.st_blocks * 512 if stat.st_blocks else stat.st_size
+            return {"logical": logical, "physical": physical}
+
+        seen: set[tuple[int, int]] = set()
+        result = {"mirror": measure(repo.mirror, seen), "source": measure(repo.path, seen)}
+        for item in self.workspaces(repo.name):
+            result[f"workspace:{item['name']}"] = measure(Path(item["path"]), seen)
+        result["total"] = {
+            key: sum(value[key] for name, value in result.items() if name != "total")
+            for key in ("logical", "physical")
+        }
+        return result
 
     def clean(self, repo: Repo) -> None:
         for item in self.workspaces(repo.name):

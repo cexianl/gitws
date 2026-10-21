@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
             print(item["path"])
         elif args.command == "size":
             for key, value in store.size(repo).items():
-                print(f"{key}\t{value}")
+                print(f"{key}\tlogical={value['logical']}\tphysical={value['physical']}")
         elif args.command == "clean":
             store.clean(repo)
             print(f"cleaned {repo.name}")

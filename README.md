@@ -5,6 +5,9 @@ named repositories. It keeps its mirrors and workspaces outside the original
 repository, pins each workspace to one commit, and never runs cleanup commands
 against the original checkout.
 
+`size` reports logical bytes and physical bytes. Physical totals deduplicate
+hard-linked files, so shared files are not counted repeatedly.
+
 ## Commands
 
 ```text
