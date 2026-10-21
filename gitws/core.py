@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +58,25 @@ def submodule_snapshot(path: Path) -> dict[str, str]:
         if len(parts) >= 2:
             result[parts[1]] = parts[0]
     return result
+
+
+def submodule_urls(path: Path) -> dict[str, str]:
+    """Return submodule path -> URL entries declared by this checkout."""
+    gitmodules = path / ".gitmodules"
+    if not gitmodules.exists():
+        return {}
+    output = run_git("config", "--file", str(gitmodules), "--get-regexp",
+                    r"^submodule\..*\.url$", cwd=path, check=False)
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        key, url = line.split(None, 1)
+        match = re.match(r"^submodule\.(.+)\.url$", key)
+        if match:
+            section = match.group(1)
+            subpath = run_git("config", "--file", str(gitmodules), "--get",
+                              f"submodule.{section}.path", cwd=path)
+            values[subpath] = url
+    return values
 
 
 def repo_id(remote: str) -> str:
@@ -129,6 +148,46 @@ class Store:
         else:
             run_git("fetch", "--prune", "origin", cwd=repo.mirror)
 
+    def submodule_mirror(self, url: str) -> Path:
+        mirror = self.repos_dir / f"{repo_id(url)}.git"
+        if not mirror.exists():
+            run_git("clone", "--mirror", url, str(mirror))
+        else:
+            run_git("fetch", "--prune", "origin", cwd=mirror)
+        return mirror
+
+    def submodule_configs(self, path: Path) -> list[str]:
+        configs: list[str] = []
+        pending = [path]
+        seen: set[Path] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for subpath, url in submodule_urls(current).items():
+                mirror = self.submodule_mirror(url)
+                configs.append(f"url.{mirror}.insteadOf={url}")
+                child = current / subpath
+                if child.is_dir():
+                    pending.append(child)
+        return configs
+
+    def update_submodules(self, path: Path) -> None:
+        run_git("submodule", "sync", "--recursive", cwd=path)
+        # Initialize direct children first so nested .gitmodules become visible;
+        # then build mappings for the complete recursive tree.
+        configs = []
+        for url in submodule_urls(path).values():
+            mirror = self.submodule_mirror(url)
+            configs.extend(["-c", f"url.{mirror}.insteadOf={url}"])
+        run_git(*configs, "submodule", "update", "--init", cwd=path)
+        configs = self.submodule_configs(path)
+        flat: list[str] = []
+        for config in configs:
+            flat.extend(["-c", config])
+        run_git(*flat, "submodule", "update", "--init", "--recursive", cwd=path)
+
     def latest(self, repo: Repo) -> str:
         self.sync_mirror(repo)
         return run_git("rev-parse", f"refs/heads/{repo.branch}", cwd=repo.mirror)
@@ -157,8 +216,7 @@ class Store:
         target.parent.mkdir(parents=True, exist_ok=True)
         run_git("worktree", "add", "--detach", str(target), commit, cwd=repo.mirror)
         try:
-            run_git("submodule", "sync", "--recursive", cwd=target)
-            run_git("submodule", "update", "--init", "--recursive", cwd=target)
+            self.update_submodules(target)
             item = {"name": name, "repo": repo.name, "path": str(target),
                     "commit": run_git("rev-parse", "HEAD", cwd=target),
                     "submodules": submodule_snapshot(target)}
