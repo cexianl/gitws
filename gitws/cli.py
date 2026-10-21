@@ -60,9 +60,12 @@ def main(argv: list[str] | None = None) -> None:
             return
         if args.command == "list":
             for repo in store.all_repos().values():
-                print(f"repo {repo.name} {repo.path}")
-                for item in store.workspaces(repo.name):
-                    print(f"  ws {item['name']} {item['commit'][:12]} {item['path']}")
+                print(f"{repo.name}  {repo.path}")
+                items = store.workspaces(repo.name)
+                if not items:
+                    print("  (no workspaces)")
+                for item in items:
+                    print(f"  {item['name']}  {item['commit'][:12]}  {item['path']}")
             return
         if args.command == "path":
             items = {item["name"]: item for item in store.workspaces()}
@@ -102,7 +105,10 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     logical = human_size(value["logical"])
                     physical = human_size(value["physical"])
-                print(f"{key}\tlogical={logical}\tphysical={physical}")
+                labels = {"mirror": "shared cache", "source": "original",
+                          "total": "total"}
+                label = labels.get(key, key.removeprefix("workspace:"))
+                print(f"{label}\tlogical={logical}\tphysical={physical}")
         elif args.command == "clean":
             store.clean(repo)
             print(f"cleaned {repo.name}")
