@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--at", dest="commit")
 
     sub.add_parser("list", help="list repositories and workspaces")
+    p = sub.add_parser("status", help="show repository and workspace status")
+    p.add_argument("name", nargs="?", help="repository alias")
     p = sub.add_parser("path", help="print a workspace path")
     p.add_argument("workspace")
     p = sub.add_parser("remove", help="remove a workspace")
@@ -66,6 +68,32 @@ def main(argv: list[str] | None = None) -> None:
                     print("  (no workspaces)")
                 for item in items:
                     print(f"  {item['name']}  {item['commit'][:12]}  {item['path']}")
+            return
+        if args.command == "status":
+            repos = store.all_repos()
+            if args.name:
+                repos = {args.name: store.get(args.name)}
+            for repo in repos.values():
+                print(f"{repo.name}  {repo.path}")
+                try:
+                    commit = run_git("rev-parse", "--short", "HEAD", cwd=repo.path)
+                    dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=repo.path))
+                    print(f"  original  {commit}  {'modified' if dirty else 'clean'}")
+                except GitwsError as exc:
+                    print(f"  original  unavailable ({exc})")
+                items = store.workspaces(repo.name)
+                if not items:
+                    print("  (no workspaces)")
+                for item in items:
+                    path = Path(item["path"])
+                    if path.exists():
+                        current = run_git("rev-parse", "--short", "HEAD", cwd=path)
+                        dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
+                        state = "modified" if dirty else "clean"
+                    else:
+                        current = item["commit"][:12]
+                        state = "missing"
+                    print(f"  {item['name']}  {current}  {state}  {path}")
             return
         if args.command == "path":
             items = {item["name"]: item for item in store.workspaces()}
