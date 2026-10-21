@@ -31,6 +31,8 @@ The state directory defaults to `~/.gitws` and can be changed with
 - `sync` and `switch` are the only commands that modify the registered checkout.
 - Both refuse dirty repositories and dirty submodules.
 - `new` creates a detached worktree below the gitws state directory.
+- Each initialized submodule uses its matching mirror as a Git reference store;
+  submodule objects are shared while working files remain isolated per workspace.
 - Removing a workspace only removes directories previously created by gitws.
 - A workspace records its exact superproject commit and recursive submodule SHAs.
 

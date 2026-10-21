@@ -158,37 +158,24 @@ class Store:
             run_git("fetch", "--prune", "origin", cwd=mirror)
         return mirror
 
-    def submodule_configs(self, path: Path) -> list[str]:
-        configs: list[str] = []
-        pending = [path]
-        seen: set[Path] = set()
-        while pending:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            for subpath, url in submodule_urls(current).items():
-                mirror = self.submodule_mirror(url)
-                configs.append(f"url.{mirror}.insteadOf={url}")
-                child = current / subpath
-                if child.is_dir():
-                    pending.append(child)
-        return configs
-
     def update_submodules(self, path: Path) -> None:
         run_git("submodule", "sync", "--recursive", cwd=path)
-        # Initialize direct children first so nested .gitmodules become visible;
-        # then build mappings for the complete recursive tree.
-        configs = []
-        for url in submodule_urls(path).values():
+        self._update_submodule_tree(path)
+
+    def _update_submodule_tree(self, path: Path) -> None:
+        # Initialize one child at a time so each clone gets its own mirror as
+        # an explicit alternates/reference store. Nested .gitmodules become
+        # visible only after their parent has been checked out.
+        for subpath, url in submodule_urls(path).items():
             mirror = self.submodule_mirror(url)
-            configs.extend(["-c", f"url.{mirror}.insteadOf={url}"])
-        run_git(*configs, "submodule", "update", "--init", cwd=path)
-        configs = self.submodule_configs(path)
-        flat: list[str] = []
-        for config in configs:
-            flat.extend(["-c", config])
-        run_git(*flat, "submodule", "update", "--init", "--recursive", cwd=path)
+            run_git(
+                "-c", f"url.{mirror}.insteadOf={url}",
+                "submodule", "update", "--init", "--reference", str(mirror),
+                subpath, cwd=path,
+            )
+            child = path / subpath
+            if child.is_dir():
+                self._update_submodule_tree(child)
 
     def latest(self, repo: Repo) -> str:
         self.sync_mirror(repo)
