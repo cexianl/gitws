@@ -74,28 +74,29 @@ Linux using `new --cow`:
 
 | Item | Measured value |
 | --- | ---: |
-| Initial setup, including mirrors and LFS | 11 min 23 s |
-| Additional COW workspace | 2 min 08 s |
-| Shared Git objects | 824.85 MiB physical |
-| Shared Git LFS objects | 628.47 MiB physical |
-| Shared full-tree base | 4.00 GiB physical |
-| One workspace write layer | 304 KiB physical |
+| Shared Git objects | 0.92 GiB physical |
+| Shared Git LFS objects | 0.63 GiB physical |
+| Shared full tracked-tree base | 6.40 GiB physical |
+| One workspace write layer | 0.0006 GiB physical |
+| Additional COW workspace creation | about 2 min 08 s |
 
 For five parallel workspaces, comparing task storage only and excluding the
 already existing original checkout:
 
 | Approach | Physical storage for five workspaces |
 | --- | ---: |
-| Five independent clones | about 87.1 GiB |
-| `gitws --cow` | about 5.43 GiB |
-| Saved by `gitws --cow` | about 81.7 GiB (93.8%) |
+| Five independent clones | about 39.75 GiB |
+| `gitws --cow` | about 7.95 GiB |
+| Saved by `gitws --cow` | about 31.80 GiB (80.0%) |
 
-The independent-clone figure is `5 × (16.01 GiB source + 0.81 GiB Git
-objects + 0.61 GiB LFS objects)`. The COW figure is one shared Git object
-store, one shared LFS store, one shared 4.00 GiB base, and five 304 KiB write
+The independent-clone figure is `5 × (6.40 GiB tracked tree + 0.92 GiB Git
+objects + 0.63 GiB LFS objects)`. The COW figure is one shared Git object
+store, one shared LFS store, one shared 6.40 GiB base, and five small write
 layers. The write-layer value is a measured sample; actual tasks consume more
-or less space according to their changes. Clone network time depends on the
-remote and was not used as a fixed benchmark.
+or less space according to their changes. The original checkout also contained
+ignored local worktrees and build files; those are not part of the tracked-tree
+comparison. Clone network time depends on the remote and was not presented as
+a fixed benchmark.
 
 ## Install
 

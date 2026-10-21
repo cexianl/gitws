@@ -94,10 +94,6 @@ def submodule_urls(path: Path) -> dict[str, str]:
         match = re.match(r"^submodule\.(.+)\.url$", key)
         if match:
             section = match.group(1)
-            update = run_git("config", "--file", str(gitmodules), "--get",
-                             f"submodule.{section}.update", cwd=path, check=False)
-            if update == "none":
-                continue
             subpath = run_git("config", "--file", str(gitmodules), "--get",
                               f"submodule.{section}.path", cwd=path)
             index_entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
@@ -125,15 +121,32 @@ def submodule_is_optional(path: Path, relative: str) -> bool:
             candidate = str(prefix / subpath) if str(prefix) != "." else subpath
             if candidate != relative:
                 continue
-            update = run_git("config", "--file", str(gitmodules), "--get",
-                             f"submodule.{section.group(1)}.update", cwd=parent,
-                             check=False)
-            if update == "none":
-                return True
             entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
                             relative, cwd=path, check=False)
             return not entry.startswith("160000 ")
     return False
+
+
+def submodule_update_override(path: Path, relative: str) -> str | None:
+    """Return a config override for submodules disabled by .gitmodules."""
+    gitmodules = path / ".gitmodules"
+    if not gitmodules.exists():
+        return None
+    output = run_git("config", "--file", str(gitmodules), "--get-regexp",
+                    r"^submodule\..*\.path$", cwd=path, check=False)
+    for key, subpath in (line.split(None, 1) for line in output.splitlines()):
+        if subpath != relative:
+            continue
+        match = re.match(r"^submodule\.(.+)\.path$", key)
+        if not match:
+            return None
+        section = match.group(1)
+        update = run_git("config", "--file", str(gitmodules), "--get",
+                         f"submodule.{section}.update", cwd=path, check=False)
+        if update == "none":
+            return f"submodule.{section}.update=checkout"
+        return None
+    return None
 
 
 def repo_id(remote: str) -> str:
@@ -257,8 +270,10 @@ class Store:
         # visible only after their parent has been checked out.
         for subpath, url in submodule_urls(path).items():
             mirror = self.submodule_mirror(url)
+            override = submodule_update_override(path, subpath)
+            update_args = ["-c", override] if override else []
             run_git(
-                "-c", "protocol.file.allow=always",
+                *update_args, "-c", "protocol.file.allow=always",
                 "-c", f"url.{mirror.as_uri()}.insteadOf={url}",
                 "submodule", "update", "--init", "--reference", str(mirror),
                 subpath, cwd=path, env=env,
@@ -299,6 +314,16 @@ class Store:
     def _ensure_base(self, repo: Repo, commit: str, env: dict[str, str]) -> Path:
         base = self.base_path(repo, commit)
         if base.is_dir():
+            incomplete = False
+            for line in run_git("submodule", "status", "--recursive", cwd=base).splitlines():
+                parts = line[1:].split() if line else []
+                if line and line[0] == "-" and len(parts) >= 2:
+                    if not submodule_is_optional(base, parts[1]):
+                        incomplete = True
+                        break
+            if incomplete:
+                self.update_submodules(base, env)
+                self.pull_lfs(base, self.lfs_path(repo))
             return base
         base.parent.mkdir(parents=True, exist_ok=True)
         run_git("worktree", "add", "--detach", str(base), commit,
@@ -502,7 +527,7 @@ class Store:
         lfs_path = self.root / "lfs" / repo_id(repo.remote)
         result = {"shared Git objects": measure(repo.mirror, seen),
                   "shared LFS objects": measure(lfs_path, seen),
-                  "original files": measure(repo.path, seen, exclude_git=True)}
+                  "original checkout": measure(repo.path, seen, exclude_git=True)}
         cow_bases: set[str] = set()
         for item in self.workspaces(repo.name):
             if item.get("mode") == "cow":
