@@ -1,5 +1,7 @@
 # gitws
 
+[中文文档](README.zh-CN.md)
+
 `gitws` is a small, local-only CLI for creating isolated Git workspaces from
 named repositories. It keeps its mirrors and workspaces outside the original
 repository, pins each workspace to one commit, and never runs cleanup commands
@@ -36,6 +38,17 @@ The state directory defaults to `~/.gitws` and can be changed with
   submodule objects are shared while working files remain isolated per workspace.
 - Removing a workspace only removes directories previously created by gitws.
 - A workspace records its exact superproject commit and recursive submodule SHAs.
+
+## gitws and native `git worktree`
+
+`gitws` uses native Git worktrees internally. It adds repository aliases,
+external mirrors, recursive submodule handling, status, disk usage, and Linux
+file locks for concurrent CLI processes. `git worktree` provides the worktree
+primitive but leaves those surrounding concerns to the user.
+
+`gitws` does not replace Git. It calls native `git`, `git-lfs`, `worktree`, and
+`submodule` commands. Workspace source files remain separate so tasks can edit
+them independently; Git and submodule objects are shared.
 
 ## Development
 
