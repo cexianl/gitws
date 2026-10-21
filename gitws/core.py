@@ -5,9 +5,15 @@ import json
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
 
 
 class GitwsError(RuntimeError):
@@ -106,6 +112,20 @@ class Store:
         for directory in (self.repos_dir, self.workspaces_dir, self.records_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.config = self.root / "config.json"
+        self.lock_path = self.root / "lock"
+
+    @contextmanager
+    def locked(self):
+        self.lock_path.touch(exist_ok=True)
+        handle = self.lock_path.open("r+")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     def _load(self) -> dict[str, Any]:
         if not self.config.exists():
@@ -135,27 +155,30 @@ class Store:
         if not branch:
             branch = "main"
         mirror = self.repos_dir / f"{repo_id(remote)}.git"
-        data = self._load()
-        data.setdefault("repos", {})[name] = Repo(name, path, remote, branch, mirror).as_dict()
-        self._save(data)
+        with self.locked():
+            data = self._load()
+            data.setdefault("repos", {})[name] = Repo(name, path, remote, branch, mirror).as_dict()
+            self._save(data)
         return self.get(name)
 
     def all_repos(self) -> dict[str, Repo]:
         return {name: self.get(name) for name in self._load().get("repos", {})}
 
     def sync_mirror(self, repo: Repo) -> None:
-        if not repo.mirror.exists():
-            repo.mirror.parent.mkdir(parents=True, exist_ok=True)
-            run_git("clone", "--mirror", repo.remote, str(repo.mirror))
-        else:
-            run_git("fetch", "--prune", "origin", cwd=repo.mirror)
+        with self.locked():
+            if not repo.mirror.exists():
+                repo.mirror.parent.mkdir(parents=True, exist_ok=True)
+                run_git("clone", "--mirror", repo.remote, str(repo.mirror))
+            else:
+                run_git("fetch", "--prune", "origin", cwd=repo.mirror)
 
     def submodule_mirror(self, url: str) -> Path:
         mirror = self.repos_dir / f"{repo_id(url)}.git"
-        if not mirror.exists():
-            run_git("clone", "--mirror", url, str(mirror))
-        else:
-            run_git("fetch", "--prune", "origin", cwd=mirror)
+        with self.locked():
+            if not mirror.exists():
+                run_git("clone", "--mirror", url, str(mirror))
+            else:
+                run_git("fetch", "--prune", "origin", cwd=mirror)
         return mirror
 
     def update_submodules(self, path: Path) -> None:

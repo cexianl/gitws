@@ -87,9 +87,13 @@ def main(argv: list[str] | None = None) -> None:
                 for item in items:
                     path = Path(item["path"])
                     if path.exists():
-                        current = run_git("rev-parse", "--short", "HEAD", cwd=path)
-                        dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
-                        state = "modified" if dirty else "clean"
+                        try:
+                            current = run_git("rev-parse", "--short", "HEAD", cwd=path)
+                            dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
+                            state = "modified" if dirty else "clean"
+                        except GitwsError:
+                            current = item["commit"][:12]
+                            state = "unavailable"
                     else:
                         current = item["commit"][:12]
                         state = "missing"
