@@ -1,7 +1,7 @@
 # gitws
 
-`gitws` 是一个简单、可控的本地 Git 工作区管理工具。它只负责仓库版本、
-隔离工作区、共享 Git 缓存和磁盘统计，不负责 AI、编译、测试或 CI。
+`gitws` 是一个简单、可控的本地 Git 工作区管理工具，用于管理仓库版本、
+隔离工作区、共享 Git 缓存和磁盘占用。
 
 英文文档见 [README.md](README.md)。
 
@@ -32,13 +32,13 @@ ln -sfn "$PWD/.venv/bin/gitws" "$HOME/.local/bin/gitws"
 ## 基本用法
 
 ```bash
-gitws add ptj1 /home/jeffrey/extends-1/repos/ai-ptj1
-gitws sync ptj1
-gitws switch ptj1 5323e011d
-gitws new ptj1 task-a
-gitws new ptj1 task-b --at def456
-gitws status ptj1
-gitws size ptj1
+gitws add project /path/to/project
+gitws sync project
+gitws switch project 5323e011d
+gitws new project task-a
+gitws new project task-b --at def456
+gitws status project
+gitws size project
 gitws remove task-a
 gitws clean ptj1
 ```
@@ -57,8 +57,7 @@ gitws clean ptj1
 | 状态和磁盘统计 | 不支持 | `status`、`size` |
 | 多进程协调 | 不负责 | Linux 文件锁 |
 
-`gitws` 不重新实现 Git，也不接管 AI 或构建流程。Git 配置、SSH 配置和认证
-仍由用户控制。
+`gitws` 使用系统 Git 命令完成仓库操作，Git 配置、SSH 配置和认证仍由用户控制。
 
 ## 安全边界
 
@@ -69,11 +68,4 @@ gitws clean ptj1
 - 工作区固定主仓库和递归子仓库 commit。
 - 当前版本面向 Linux，使用 `fcntl` 文件锁。
 
-## 开发和测试
 
-```bash
-python -m unittest discover -s tests -v
-python -m compileall -q gitws tests
-```
-
-GitHub Actions 会在 Python 3.10、3.12、3.13 上执行编译检查和测试。

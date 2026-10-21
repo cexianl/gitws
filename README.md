@@ -50,15 +50,6 @@ primitive but leaves those surrounding concerns to the user.
 `submodule` commands. Workspace source files remain separate so tasks can edit
 them independently; Git and submodule objects are shared.
 
-## Development
-
-```bash
-python -m gitws --help
-python -m unittest discover -s tests -v
-```
-
-For local use without packaging, run `python -m gitws ...` from this directory.
-
 ## Install
 
 Install the current GitHub version with pip:
