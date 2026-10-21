@@ -6,6 +6,18 @@ from pathlib import Path
 from .core import GitwsError, Store, ensure_clean, ensure_repo, run_git
 
 
+def human_size(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{value} B"
+            return f"{amount:.2f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gitws", description="Small Git workspace manager")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -32,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("workspace")
     p = sub.add_parser("size", help="show repository disk usage")
     p.add_argument("name")
+    p.add_argument("--bytes", action="store_true", help="show exact byte counts")
     p = sub.add_parser("clean", help="prune stale records and mirror data")
     p.add_argument("name")
     return parser
@@ -83,7 +96,13 @@ def main(argv: list[str] | None = None) -> None:
             print(item["path"])
         elif args.command == "size":
             for key, value in store.size(repo).items():
-                print(f"{key}\tlogical={value['logical']}\tphysical={value['physical']}")
+                if args.bytes:
+                    logical = str(value["logical"])
+                    physical = str(value["physical"])
+                else:
+                    logical = human_size(value["logical"])
+                    physical = human_size(value["physical"])
+                print(f"{key}\tlogical={logical}\tphysical={physical}")
         elif args.command == "clean":
             store.clean(repo)
             print(f"cleaned {repo.name}")

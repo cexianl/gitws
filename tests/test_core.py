@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from gitws.core import GitwsError, Store, run_git
+from gitws.cli import human_size
 
 
 class GitwsTests(unittest.TestCase):
@@ -49,6 +50,10 @@ class GitwsTests(unittest.TestCase):
         self.assertIn("total", result)
         self.assertIn("workspace:a", result)
         self.assertGreater(result["total"]["logical"], 0)
+
+    def test_human_size(self):
+        self.assertEqual(human_size(0), "0 B")
+        self.assertEqual(human_size(1024 * 1024), "1.00 MiB")
 
 
 if __name__ == "__main__":
