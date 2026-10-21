@@ -7,8 +7,8 @@ named repositories. It keeps its mirrors and workspaces outside the original
 repository, pins each workspace to one commit, and never runs cleanup commands
 against the original checkout.
 
-`size` reports logical bytes and physical bytes. Physical totals deduplicate
-hard-linked files, so shared files are not counted repeatedly.
+`usage` reports logical bytes and physical bytes. Physical totals deduplicate
+shared files, so shared files are not counted repeatedly.
 
 ## Commands
 
@@ -21,7 +21,7 @@ gitws path <workspace>
 gitws list
 gitws status [name]
 gitws remove <workspace>
-gitws size <name>
+gitws usage <name>
 gitws doctor <name>
 gitws clean <name>
 ```
@@ -66,6 +66,26 @@ primitive but leaves those surrounding concerns to the user.
 `submodule` commands. Workspace source files remain separate so tasks can edit
 them independently; Git, submodule, and (when available) Git LFS objects are
 shared.
+
+## Measured example
+
+An anonymized large repository with many recursive submodules was measured on
+Linux using `new --cow`:
+
+| Item | Measured value |
+| --- | ---: |
+| Initial setup, including mirrors and LFS | 11 min 23 s |
+| Additional COW workspace | 2 min 08 s |
+| Shared Git objects | 824.85 MiB physical |
+| Shared Git LFS objects | 628.47 MiB physical |
+| Shared full-tree base | 4.00 GiB physical |
+| One workspace write layer | 304 KiB physical |
+
+Two independent full source copies would require about 32 GiB for the source
+tree alone in this sample. The COW workspaces use one shared base and small
+per-workspace write layers. The independent-clone comparison was calculated
+from the measured source tree size; its network time depends on the remote and
+was not presented as a benchmark.
 
 ## Install
 

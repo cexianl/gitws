@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -311,6 +312,57 @@ class Store:
                     cwd=repo.mirror, check=False)
             raise
 
+    def _prepare_cow_metadata(self, base: Path, target: Path, upper: Path,
+                              storage: Path) -> None:
+        """Create only Git metadata; source files come from the lower layer."""
+        run_git("worktree", "add", "--detach", "--no-checkout", str(target),
+                run_git("rev-parse", "HEAD", cwd=base), cwd=base)
+        run_git("reset", "--mixed", "HEAD", cwd=target)
+        run_git("config", "lfs.storage", str(storage), cwd=target)
+        metadata = target / ".git"
+        destination = upper / ".git"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(metadata, destination)
+        self._prepare_cow_children(base, target, upper, storage)
+
+    def _prepare_cow_children(self, base: Path, target: Path, upper: Path,
+                              storage: Path) -> None:
+        entries = list(submodule_urls(base))
+
+        def prepare(subpath: str) -> None:
+            base_child = base / subpath
+            target_child = target / subpath
+            if not base_child.is_dir():
+                return
+            target_child.parent.mkdir(parents=True, exist_ok=True)
+            commit = run_git("rev-parse", "HEAD", cwd=base_child)
+            run_git("worktree", "add", "--detach", "--no-checkout",
+                    str(target_child), commit, cwd=base_child)
+            run_git("reset", "--mixed", "HEAD", cwd=target_child)
+            run_git("config", "lfs.storage", str(storage), cwd=target_child)
+            child_metadata = target_child / ".git"
+            child_destination = upper / subpath / ".git"
+            child_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child_metadata, child_destination)
+            self._prepare_cow_children(base_child, target_child, upper / subpath,
+                                       storage)
+
+        if len(entries) < 2:
+            for subpath in entries:
+                prepare(subpath)
+            return
+        with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
+            list(pool.map(prepare, entries))
+
+    def _remove_cow_metadata(self, base: Path, target: Path) -> None:
+        for subpath in submodule_urls(base):
+            base_child = base / subpath
+            target_child = target / subpath
+            if base_child.is_dir() and target_child.exists():
+                self._remove_cow_metadata(base_child, target_child)
+                run_git("worktree", "remove", "--force", str(target_child),
+                        cwd=base_child, check=False)
+
     def _mount_cow(self, lower: Path, upper: Path, work: Path,
                    target: Path) -> str:
         options = f"lowerdir={lower},upperdir={upper},workdir={work}"
@@ -373,22 +425,8 @@ class Store:
                 work = self.cow_dir / name / "work"
                 upper.mkdir(parents=True, exist_ok=True)
                 work.mkdir(parents=True, exist_ok=True)
-                run_git("worktree", "add", "--detach", str(target), commit,
-                        cwd=repo.mirror, env=lfs_env)
                 try:
-                    self.update_submodules(target, lfs_env)
-                    self.pull_lfs(target, lfs_storage)
-                    for metadata in self._metadata_files(target):
-                        relative = metadata.relative_to(target)
-                        destination = upper / relative
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(metadata, destination)
-                    for child in target.iterdir():
-                        if child.name != ".git":
-                            if child.is_dir() and not child.is_symlink():
-                                shutil.rmtree(child)
-                            else:
-                                child.unlink()
+                    self._prepare_cow_metadata(base, target, upper, lfs_storage)
                     backend = self._mount_cow(base, upper, work, target)
                     item = {"name": name, "repo": repo.name, "path": str(target),
                             "commit": run_git("rev-parse", "HEAD", cwd=target),
@@ -399,6 +437,7 @@ class Store:
                     return item
                 except Exception:
                     self._unmount_cow(target)
+                    self._remove_cow_metadata(base, target)
                     run_git("worktree", "remove", "--force", str(target),
                             cwd=repo.mirror, check=False)
                     shutil.rmtree(self.cow_dir / name, ignore_errors=True)
@@ -429,12 +468,13 @@ class Store:
                 raise GitwsError("refusing to remove a path outside gitws workspaces")
             if item.get("mode") == "cow":
                 self._unmount_cow(target)
+                self._remove_cow_metadata(Path(item["base"]), target)
             run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
             record.unlink(missing_ok=True)
             if item.get("mode") == "cow":
                 shutil.rmtree(self.cow_dir / name, ignore_errors=True)
 
-    def size(self, repo: Repo) -> dict[str, dict[str, int]]:
+    def usage(self, repo: Repo) -> dict[str, dict[str, int]]:
         def measure(path: Path, seen: set[tuple[int, int]], exclude_git: bool = False) -> dict[str, int]:
             logical = 0
             physical = 0

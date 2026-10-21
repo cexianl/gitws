@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from .core import GitwsError, Store, ensure_clean, ensure_repo, run_git
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("workspace")
     p = sub.add_parser("remove", help="remove a workspace")
     p.add_argument("workspace")
-    p = sub.add_parser("size", help="show repository disk usage")
+    p = sub.add_parser("usage", help="show repository disk usage")
     p.add_argument("name")
     p.add_argument("--bytes", action="store_true", help="show exact byte counts")
     p = sub.add_parser("doctor", help="check repository and workspace integrity")
@@ -59,7 +60,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    homes: list[Path] = []
+    filtered: list[str] = []
+    index = 0
+    while index < len(raw):
+        if raw[index] == "--home":
+            if index + 1 >= len(raw):
+                raise SystemExit("gitws: error: --home requires a directory")
+            homes.append(Path(raw[index + 1]))
+            index += 2
+            continue
+        filtered.append(raw[index])
+        index += 1
+    args = build_parser().parse_args(filtered)
+    if homes:
+        args.home = homes[-1]
     store = Store(args.home)
     try:
         if args.command == "add":
@@ -140,8 +156,8 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "new":
             item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
             print(item["path"])
-        elif args.command == "size":
-            for key, value in store.size(repo).items():
+        elif args.command == "usage":
+            for key, value in store.usage(repo).items():
                 if args.bytes:
                     logical = str(value["logical"])
                     physical = str(value["physical"])
