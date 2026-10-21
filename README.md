@@ -1,0 +1,41 @@
+# gitws
+
+`gitws` is a small, local-only CLI for creating isolated Git workspaces from
+named repositories. It keeps its mirrors and workspaces outside the original
+repository, pins each workspace to one commit, and never runs cleanup commands
+against the original checkout.
+
+## Commands
+
+```text
+gitws add <name> <path>
+gitws sync <name>
+gitws switch <name> <commit>
+gitws new <name> <workspace> [--at COMMIT]
+gitws path <workspace>
+gitws list
+gitws remove <workspace>
+gitws size <name>
+gitws clean <name>
+```
+
+The state directory defaults to `~/.gitws` and can be changed with
+`GITWS_HOME`.
+
+## Safety model
+
+- `add` only records the canonical path, remote URL, and branch.
+- `sync` and `switch` are the only commands that modify the registered checkout.
+- Both refuse dirty repositories and dirty submodules.
+- `new` creates a detached worktree below the gitws state directory.
+- Removing a workspace only removes directories previously created by gitws.
+- A workspace records its exact superproject commit and recursive submodule SHAs.
+
+## Development
+
+```bash
+python -m gitws --help
+python -m unittest discover -s tests -v
+```
+
+For local use without packaging, run `python -m gitws ...` from this directory.
