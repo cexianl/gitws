@@ -45,6 +45,13 @@ For local use without packaging, run `python -m gitws ...` from this directory.
 
 ## Install
 
+Install the current GitHub version with pip:
+
+```bash
+python3 -m pip install "git+https://github.com/cexianl/gitws.git"
+gitws --help
+```
+
 On systems with an externally managed Python installation, use a virtual
 environment:
 
