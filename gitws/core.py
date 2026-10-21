@@ -112,12 +112,14 @@ class Store:
         for directory in (self.repos_dir, self.workspaces_dir, self.records_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.config = self.root / "config.json"
-        self.lock_path = self.root / "lock"
+        self.state_lock_path = self.root / "state.lock"
+        self.mirror_lock_path = self.root / "mirror.lock"
 
     @contextmanager
-    def locked(self):
-        self.lock_path.touch(exist_ok=True)
-        handle = self.lock_path.open("r+")
+    def locked(self, kind: str = "state"):
+        lock_path = self.state_lock_path if kind == "state" else self.mirror_lock_path
+        lock_path.touch(exist_ok=True)
+        handle = lock_path.open("r+")
         try:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -165,7 +167,7 @@ class Store:
         return {name: self.get(name) for name in self._load().get("repos", {})}
 
     def sync_mirror(self, repo: Repo) -> None:
-        with self.locked():
+        with self.locked("mirror"):
             if not repo.mirror.exists():
                 repo.mirror.parent.mkdir(parents=True, exist_ok=True)
                 run_git("clone", "--mirror", repo.remote, str(repo.mirror))
@@ -174,7 +176,7 @@ class Store:
 
     def submodule_mirror(self, url: str) -> Path:
         mirror = self.repos_dir / f"{repo_id(url)}.git"
-        with self.locked():
+        with self.locked("mirror"):
             if not mirror.exists():
                 run_git("clone", "--mirror", url, str(mirror))
             else:
@@ -216,39 +218,41 @@ class Store:
         return values
 
     def create_workspace(self, repo: Repo, name: str, commit: str | None) -> dict[str, Any]:
-        if not name or "/" in name or name in {".", ".."}:
-            raise GitwsError("workspace name must be a simple name")
-        record = self.record_path(name)
-        target = self.workspaces_dir / name
-        if record.exists() or target.exists():
-            raise GitwsError(f"workspace already exists: {name}")
-        self.sync_mirror(repo)
-        commit = commit or self.latest(repo)
-        run_git("cat-file", "-e", f"{commit}^{{commit}}", cwd=repo.mirror)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        run_git("worktree", "add", "--detach", str(target), commit, cwd=repo.mirror)
-        try:
-            self.update_submodules(target)
-            item = {"name": name, "repo": repo.name, "path": str(target),
-                    "commit": run_git("rev-parse", "HEAD", cwd=target),
-                    "submodules": submodule_snapshot(target)}
-            record.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
-            return item
-        except Exception:
-            run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror, check=False)
-            raise
+        with self.locked("state"):
+            if not name or "/" in name or name in {".", ".."}:
+                raise GitwsError("workspace name must be a simple name")
+            record = self.record_path(name)
+            target = self.workspaces_dir / name
+            if record.exists() or target.exists():
+                raise GitwsError(f"workspace already exists: {name}")
+            self.sync_mirror(repo)
+            commit = commit or self.latest(repo)
+            run_git("cat-file", "-e", f"{commit}^{{commit}}", cwd=repo.mirror)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            run_git("worktree", "add", "--detach", str(target), commit, cwd=repo.mirror)
+            try:
+                self.update_submodules(target)
+                item = {"name": name, "repo": repo.name, "path": str(target),
+                        "commit": run_git("rev-parse", "HEAD", cwd=target),
+                        "submodules": submodule_snapshot(target)}
+                record.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
+                return item
+            except Exception:
+                run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror, check=False)
+                raise
 
     def remove_workspace(self, name: str) -> None:
-        record = self.records_dir / f"{name}.json"
-        if not record.exists():
-            raise GitwsError(f"unknown workspace: {name}")
-        item = json.loads(record.read_text())
-        repo = self.get(item["repo"])
-        target = Path(item["path"]).resolve()
-        if self.workspaces_dir not in target.parents:
-            raise GitwsError("refusing to remove a path outside gitws workspaces")
-        run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
-        record.unlink(missing_ok=True)
+        with self.locked("state"):
+            record = self.records_dir / f"{name}.json"
+            if not record.exists():
+                raise GitwsError(f"unknown workspace: {name}")
+            item = json.loads(record.read_text())
+            repo = self.get(item["repo"])
+            target = Path(item["path"]).resolve()
+            if self.workspaces_dir not in target.parents:
+                raise GitwsError("refusing to remove a path outside gitws workspaces")
+            run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
+            record.unlink(missing_ok=True)
 
     def size(self, repo: Repo) -> dict[str, dict[str, int]]:
         def measure(path: Path, seen: set[tuple[int, int]]) -> dict[str, int]:
@@ -282,9 +286,10 @@ class Store:
         return result
 
     def clean(self, repo: Repo) -> None:
-        for item in self.workspaces(repo.name):
-            path = Path(item["path"])
-            if not path.exists():
-                self.record_path(item["name"]).unlink(missing_ok=True)
-        if repo.mirror.exists():
-            run_git("worktree", "prune", cwd=repo.mirror)
+        with self.locked("state"):
+            for item in self.workspaces(repo.name):
+                path = Path(item["path"])
+                if not path.exists():
+                    self.record_path(item["name"]).unlink(missing_ok=True)
+            if repo.mirror.exists():
+                run_git("worktree", "prune", cwd=repo.mirror)

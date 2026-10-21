@@ -113,18 +113,20 @@ def main(argv: list[str] | None = None) -> None:
 
         repo = store.get(args.name)
         if args.command == "sync":
-            ensure_clean(repo.path)
-            store.sync_mirror(repo)
-            commit = store.latest(repo)
-            run_git("switch", "--detach", commit, cwd=repo.path)
-            store.update_submodules(repo.path)
+            with store.locked("state"):
+                ensure_clean(repo.path)
+                store.sync_mirror(repo)
+                commit = store.latest(repo)
+                run_git("switch", "--detach", commit, cwd=repo.path)
+                store.update_submodules(repo.path)
             print(commit)
         elif args.command == "switch":
-            ensure_clean(repo.path)
-            store.sync_mirror(repo)
-            run_git("cat-file", "-e", f"{args.commit}^{{commit}}", cwd=repo.mirror)
-            run_git("switch", "--detach", args.commit, cwd=repo.path)
-            store.update_submodules(repo.path)
+            with store.locked("state"):
+                ensure_clean(repo.path)
+                store.sync_mirror(repo)
+                run_git("cat-file", "-e", f"{args.commit}^{{commit}}", cwd=repo.mirror)
+                run_git("switch", "--detach", args.commit, cwd=repo.path)
+                store.update_submodules(repo.path)
             print(args.commit)
         elif args.command == "new":
             item = store.create_workspace(repo, args.workspace, args.commit)

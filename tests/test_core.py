@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from gitws.core import GitwsError, Store, run_git
@@ -59,6 +60,16 @@ class GitwsTests(unittest.TestCase):
         self.assertIn("total", result)
         self.assertIn("workspace:a", result)
         self.assertGreater(result["total"]["logical"], 0)
+
+    def test_parallel_workspace_creation_is_serialized(self):
+        repo = self.store.add("demo", self.source)
+        first = run_git("rev-parse", "HEAD", cwd=self.source)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            items = list(pool.map(
+                lambda name: self.store.create_workspace(repo, name, first),
+                ("parallel-a", "parallel-b"),
+            ))
+        self.assertEqual({item["name"] for item in items}, {"parallel-a", "parallel-b"})
 
     def test_human_size(self):
         self.assertEqual(human_size(0), "0 B")
