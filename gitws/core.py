@@ -93,8 +93,16 @@ def submodule_urls(path: Path) -> dict[str, str]:
         match = re.match(r"^submodule\.(.+)\.url$", key)
         if match:
             section = match.group(1)
+            update = run_git("config", "--file", str(gitmodules), "--get",
+                             f"submodule.{section}.update", cwd=path, check=False)
+            if update == "none":
+                continue
             subpath = run_git("config", "--file", str(gitmodules), "--get",
                               f"submodule.{section}.path", cwd=path)
+            index_entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
+                                  subpath, cwd=path, check=False)
+            if not index_entry.startswith("160000 "):
+                continue
             values[subpath] = url
     return values
 
@@ -221,7 +229,8 @@ class Store:
         for subpath, url in submodule_urls(path).items():
             mirror = self.submodule_mirror(url)
             run_git(
-                "-c", f"url.{mirror}.insteadOf={url}",
+                "-c", "protocol.file.allow=always",
+                "-c", f"url.{mirror.as_uri()}.insteadOf={url}",
                 "submodule", "update", "--init", "--reference", str(mirror),
                 subpath, cwd=path, env=env,
             )

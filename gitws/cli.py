@@ -20,6 +20,8 @@ def human_size(value: int) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gitws", description="Small Git workspace manager")
+    parser.add_argument("--home", type=Path,
+                        help="store mirrors and workspaces under this directory")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("add", help="register a local repository")
@@ -58,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    store = Store()
+    store = Store(args.home)
     try:
         if args.command == "add":
             repo = store.add(args.name, args.path)

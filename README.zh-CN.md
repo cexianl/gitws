@@ -30,6 +30,14 @@ ln -sfn "$PWD/.venv/bin/gitws" "$HOME/.local/bin/gitws"
 
 默认状态目录是 `~/.gitws`，也可以通过 `GITWS_HOME` 修改。
 
+也可以在命令中直接指定存储目录：
+
+```bash
+gitws --home /data/gitws new project task-a --cow
+```
+
+命令行中的 `--home` 优先级高于 `GITWS_HOME`。
+
 ## 基本用法
 
 ```bash

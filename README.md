@@ -29,6 +29,14 @@ gitws clean <name>
 The state directory defaults to `~/.gitws` and can be changed with
 `GITWS_HOME`.
 
+You can also choose it per command:
+
+```bash
+gitws --home /data/gitws new project task-a --cow
+```
+
+The `--home` option takes precedence over `GITWS_HOME`.
+
 `--cow` is an optional Linux feature. Remove these workspaces with `gitws
 remove` so their filesystem mounts can be unmounted cleanly.
 
