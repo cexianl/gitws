@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -127,6 +128,15 @@ class GitwsTests(unittest.TestCase):
         self.assertEqual(alternates[0], alternates[1])
         self.assertIn(str(sub_mirror / "objects"), alternates[0])
 
+        cow = self.store.create_workspace(repo, "cow-submodule", first["commit"], cow=True)
+        try:
+            submodule_path = Path(cow["path"]) / "modules/lib"
+            self.assertEqual("shared\n", (submodule_path / "lib.txt").read_text())
+            (submodule_path / "lib.txt").write_text("changed\n")
+            self.assertEqual("shared\n", (Path(first["path"]) / "modules/lib/lib.txt").read_text())
+        finally:
+            self.store.remove_workspace("cow-submodule")
+
     def test_workspaces_share_lfs_storage_and_plain_repo_still_works(self):
         repo = self.store.add("demo", self.source)
         first = self.store.create_workspace(repo, "lfs-one", None)
@@ -138,6 +148,26 @@ class GitwsTests(unittest.TestCase):
             self.assertEqual(expected, run_git("config", "--get", "lfs.storage", cwd=workspace))
 
         self.assertTrue(Path(expected).is_dir())
+
+    @unittest.skipUnless(shutil.which("fuse-overlayfs") or os.geteuid() == 0,
+                         "overlayfs or fuse-overlayfs is unavailable")
+    def test_cow_workspace_has_full_tree_and_isolated_changes(self):
+        repo = self.store.add("demo", self.source)
+        first = self.store.create_workspace(repo, "cow-one", None, cow=True)
+        second = self.store.create_workspace(repo, "cow-two", first["commit"], cow=True)
+        first_path = Path(first["path"])
+        second_path = Path(second["path"])
+
+        self.assertEqual("one\n", (second_path / "README").read_text())
+        (first_path / "README").write_text("changed\n")
+        self.assertEqual("changed\n", (first_path / "README").read_text())
+        self.assertEqual("one\n", (second_path / "README").read_text())
+        self.assertTrue(run_git("status", "--porcelain", cwd=first_path))
+        usage = self.store.size(repo)
+        self.assertTrue(any(key.startswith("shared base:") for key in usage))
+        self.assertIn("workspace:cow-one writes", usage)
+        self.store.remove_workspace("cow-one")
+        self.store.remove_workspace("cow-two")
 
 if __name__ == "__main__":
     unittest.main()

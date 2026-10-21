@@ -16,7 +16,7 @@ hard-linked files, so shared files are not counted repeatedly.
 gitws add <name> <path>
 gitws sync <name>
 gitws switch <name> <commit>
-gitws new <name> <workspace> [--at COMMIT]
+gitws new <name> <workspace> [--at COMMIT] [--cow]
 gitws path <workspace>
 gitws list
 gitws status [name]
@@ -29,6 +29,9 @@ gitws clean <name>
 The state directory defaults to `~/.gitws` and can be changed with
 `GITWS_HOME`.
 
+`--cow` is an optional Linux feature. Remove these workspaces with `gitws
+remove` so their filesystem mounts can be unmounted cleanly.
+
 ## Safety model
 
 - `add` only records the canonical path, remote URL, and branch.
@@ -39,6 +42,8 @@ The state directory defaults to `~/.gitws` and can be changed with
   submodule objects are shared while working files remain isolated per workspace.
 - When Git LFS is installed, workspaces for the same repository use one shared
   LFS object store; each workspace still has its own working files.
+- `new --cow` creates a full-tree copy-on-write workspace with OverlayFS. It
+  uses `fuse-overlayfs` when a normal mount is not available.
 - Removing a workspace only removes directories previously created by gitws.
 - A workspace records its exact superproject commit and recursive submodule SHAs.
 

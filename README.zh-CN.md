@@ -38,6 +38,7 @@ gitws sync project
 gitws switch project 5323e011d
 gitws new project task-a
 gitws new project task-b --at def456
+gitws new project task-c --cow
 gitws status project
 gitws size project
 gitws doctor project
@@ -61,6 +62,7 @@ gitws clean ptj1
 
 `gitws` 使用系统 Git 命令完成仓库操作，Git 配置、SSH 配置和认证仍由用户控制。
 如果系统安装了 Git LFS，`size` 会单独统计共享的 LFS 对象存储。
+`new --cow` 会使用 OverlayFS 创建完整目录树的写时复制工作区；普通挂载不可用时会尝试使用 `fuse-overlayfs`。这是 Linux 下的可选高级功能，工作区应使用 `gitws remove` 删除，以便正确卸载挂载点。
 
 ## 安全边界
 

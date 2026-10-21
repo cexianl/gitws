@@ -33,6 +33,18 @@ def run_git(*args: str, cwd: Path | None = None, check: bool = True,
     return proc.stdout.strip()
 
 
+def run_command(*args: str, cwd: Path | None = None,
+                check: bool = True) -> str:
+    proc = subprocess.run(
+        list(args), cwd=cwd, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode:
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise GitwsError(f"{' '.join(args)} failed: {detail}")
+    return proc.stdout.strip()
+
+
 def git_dir(path: Path) -> Path:
     value = run_git("rev-parse", "--git-dir", cwd=path)
     result = Path(value)
@@ -110,7 +122,10 @@ class Store:
         self.repos_dir = self.root / "repos"
         self.workspaces_dir = self.root / "workspaces"
         self.records_dir = self.root / "records"
-        for directory in (self.repos_dir, self.workspaces_dir, self.records_dir):
+        self.bases_dir = self.root / "bases"
+        self.cow_dir = self.root / "cow"
+        for directory in (self.repos_dir, self.workspaces_dir, self.records_dir,
+                          self.bases_dir, self.cow_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.config = self.root / "config.json"
         self.state_lock_path = self.root / "state.lock"
@@ -231,6 +246,66 @@ class Store:
     def record_path(self, name: str) -> Path:
         return self.records_dir / f"{name}.json"
 
+    def base_path(self, repo: Repo, commit: str) -> Path:
+        return self.bases_dir / repo_id(repo.remote) / commit
+
+    @staticmethod
+    def _metadata_files(path: Path) -> list[Path]:
+        values: list[Path] = []
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [name for name in dirs if name != ".git"]
+            if ".git" in files:
+                values.append(Path(root) / ".git")
+        return values
+
+    def _ensure_base(self, repo: Repo, commit: str, env: dict[str, str]) -> Path:
+        base = self.base_path(repo, commit)
+        if base.is_dir():
+            return base
+        base.parent.mkdir(parents=True, exist_ok=True)
+        run_git("worktree", "add", "--detach", str(base), commit,
+                cwd=repo.mirror, env=env)
+        try:
+            self.update_submodules(base, env)
+            self.pull_lfs(base, self.lfs_path(repo))
+            return base
+        except Exception:
+            run_git("worktree", "remove", "--force", str(base),
+                    cwd=repo.mirror, check=False)
+            raise
+
+    def _mount_cow(self, lower: Path, upper: Path, work: Path,
+                   target: Path) -> str:
+        options = f"lowerdir={lower},upperdir={upper},workdir={work}"
+        if os.geteuid() == 0 and shutil.which("mount"):
+            try:
+                run_command("mount", "-t", "overlay", "overlay", "-o", options,
+                            str(target))
+                return "overlayfs"
+            except GitwsError:
+                pass
+        fuse = shutil.which("fuse-overlayfs")
+        if fuse:
+            run_command(fuse, "-o", options, str(target))
+            return "fuse-overlayfs"
+        raise GitwsError("copy-on-write workspaces require overlayfs or fuse-overlayfs")
+
+    @staticmethod
+    def is_mounted(path: Path) -> bool:
+        try:
+            mounts = Path("/proc/self/mountinfo").read_text().splitlines()
+        except OSError:
+            return False
+        needle = str(path.resolve())
+        return any(f" {needle} " in line or line.endswith(f" {needle}") for line in mounts)
+
+    def _unmount_cow(self, target: Path) -> None:
+        if not self.is_mounted(target):
+            return
+        if shutil.which("umount") is None:
+            raise GitwsError("cannot remove copy-on-write workspace: umount is unavailable")
+        run_command("umount", str(target))
+
     def workspaces(self, repo_name: str | None = None) -> list[dict[str, Any]]:
         values = []
         for path in sorted(self.records_dir.glob("*.json")):
@@ -239,7 +314,8 @@ class Store:
                 values.append(item)
         return values
 
-    def create_workspace(self, repo: Repo, name: str, commit: str | None) -> dict[str, Any]:
+    def create_workspace(self, repo: Repo, name: str, commit: str | None,
+                         cow: bool = False) -> dict[str, Any]:
         with self.locked("state"):
             if not name or "/" in name or name in {".", ".."}:
                 raise GitwsError("workspace name must be a simple name")
@@ -249,10 +325,47 @@ class Store:
                 raise GitwsError(f"workspace already exists: {name}")
             self.sync_mirror(repo)
             commit = commit or self.latest(repo)
-            run_git("cat-file", "-e", f"{commit}^{{commit}}", cwd=repo.mirror)
+            commit = run_git("rev-parse", "--verify", f"{commit}^{{commit}}",
+                             cwd=repo.mirror)
             target.parent.mkdir(parents=True, exist_ok=True)
             lfs_storage = self.lfs_path(repo)
             lfs_env = self._lfs_env()
+            if cow:
+                base = self._ensure_base(repo, commit, lfs_env)
+                upper = self.cow_dir / name / "upper"
+                work = self.cow_dir / name / "work"
+                upper.mkdir(parents=True, exist_ok=True)
+                work.mkdir(parents=True, exist_ok=True)
+                run_git("worktree", "add", "--detach", str(target), commit,
+                        cwd=repo.mirror, env=lfs_env)
+                try:
+                    self.update_submodules(target, lfs_env)
+                    self.pull_lfs(target, lfs_storage)
+                    for metadata in self._metadata_files(target):
+                        relative = metadata.relative_to(target)
+                        destination = upper / relative
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(metadata, destination)
+                    for child in target.iterdir():
+                        if child.name != ".git":
+                            if child.is_dir() and not child.is_symlink():
+                                shutil.rmtree(child)
+                            else:
+                                child.unlink()
+                    backend = self._mount_cow(base, upper, work, target)
+                    item = {"name": name, "repo": repo.name, "path": str(target),
+                            "commit": run_git("rev-parse", "HEAD", cwd=target),
+                            "submodules": submodule_snapshot(target),
+                            "mode": "cow", "backend": backend,
+                            "base": str(base), "upper": str(upper), "work": str(work)}
+                    record.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
+                    return item
+                except Exception:
+                    self._unmount_cow(target)
+                    run_git("worktree", "remove", "--force", str(target),
+                            cwd=repo.mirror, check=False)
+                    shutil.rmtree(self.cow_dir / name, ignore_errors=True)
+                    raise
             run_git("worktree", "add", "--detach", str(target), commit,
                     cwd=repo.mirror, env=lfs_env)
             try:
@@ -277,8 +390,12 @@ class Store:
             target = Path(item["path"]).resolve()
             if self.workspaces_dir not in target.parents:
                 raise GitwsError("refusing to remove a path outside gitws workspaces")
+            if item.get("mode") == "cow":
+                self._unmount_cow(target)
             run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
             record.unlink(missing_ok=True)
+            if item.get("mode") == "cow":
+                shutil.rmtree(self.cow_dir / name, ignore_errors=True)
 
     def size(self, repo: Repo) -> dict[str, dict[str, int]]:
         def measure(path: Path, seen: set[tuple[int, int]], exclude_git: bool = False) -> dict[str, int]:
@@ -309,8 +426,18 @@ class Store:
         result = {"shared Git objects": measure(repo.mirror, seen),
                   "shared LFS objects": measure(lfs_path, seen),
                   "original files": measure(repo.path, seen, exclude_git=True)}
+        cow_bases: set[str] = set()
         for item in self.workspaces(repo.name):
-            result[f"workspace:{item['name']}"] = measure(Path(item["path"]), seen, exclude_git=True)
+            if item.get("mode") == "cow":
+                base = Path(item["base"])
+                if str(base) not in cow_bases:
+                    result[f"shared base:{base.name}"] = measure(base, seen, exclude_git=True)
+                    cow_bases.add(str(base))
+                result[f"workspace:{item['name']} writes"] = measure(
+                    Path(item["upper"]), seen, exclude_git=True)
+            else:
+                result[f"workspace:{item['name']}"] = measure(
+                    Path(item["path"]), seen, exclude_git=True)
         result["total"] = {
             key: sum(value[key] for name, value in result.items() if name != "total")
             for key in ("logical", "physical")
@@ -340,6 +467,9 @@ class Store:
                 problems.append(f"workspace is missing: {item['name']}")
                 continue
             try:
+                if item.get("mode") == "cow" and not self.is_mounted(path):
+                    problems.append(f"workspace is not mounted: {item['name']}")
+                    continue
                 current = run_git("rev-parse", "HEAD", cwd=path)
                 if current != item["commit"]:
                     problems.append(f"workspace commit changed: {item['name']}")

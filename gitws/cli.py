@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("workspace")
     p.add_argument("--at", dest="commit")
+    p.add_argument("--cow", action="store_true",
+                   help="use a copy-on-write OverlayFS workspace")
 
     sub.add_parser("list", help="list repositories and workspaces")
     p = sub.add_parser("status", help="show repository and workspace status")
@@ -88,7 +90,10 @@ def main(argv: list[str] | None = None) -> None:
                     print("  (no workspaces)")
                 for item in items:
                     path = Path(item["path"])
-                    if path.exists():
+                    if item.get("mode") == "cow" and not store.is_mounted(path):
+                        current = item["commit"][:12]
+                        state = "not mounted"
+                    elif path.exists():
                         try:
                             current = run_git("rev-parse", "--short", "HEAD", cwd=path)
                             dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
@@ -131,7 +136,7 @@ def main(argv: list[str] | None = None) -> None:
                 store.update_submodules(repo.path)
             print(args.commit)
         elif args.command == "new":
-            item = store.create_workspace(repo, args.workspace, args.commit)
+            item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
             print(item["path"])
         elif args.command == "size":
             for key, value in store.size(repo).items():
