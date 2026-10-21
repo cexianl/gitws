@@ -14,10 +14,11 @@ class GitwsError(RuntimeError):
     pass
 
 
-def run_git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
+def run_git(*args: str, cwd: Path | None = None, check: bool = True,
+            env: dict[str, str] | None = None) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=cwd, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env,
     )
     if check and proc.returncode:
         detail = proc.stderr.strip() or proc.stdout.strip()
@@ -120,7 +121,8 @@ class Store:
         raw = self._load().get("repos", {}).get(name)
         if not raw:
             raise GitwsError(f"unknown repository alias: {name}")
-        return Repo(name, Path(raw["path"]), raw["remote"], raw["branch"], Path(raw["mirror"]))
+        return Repo(name, Path(raw["path"]), raw["remote"], raw["branch"],
+                    Path(raw["mirror"]))
 
     def add(self, name: str, path: Path) -> Repo:
         if not name or "/" in name or name in {".", ".."}:

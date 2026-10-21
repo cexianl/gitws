@@ -55,6 +55,5 @@ class GitwsTests(unittest.TestCase):
         self.assertEqual(human_size(0), "0 B")
         self.assertEqual(human_size(1024 * 1024), "1.00 MiB")
 
-
 if __name__ == "__main__":
     unittest.main()
