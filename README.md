@@ -42,3 +42,16 @@ python -m unittest discover -s tests -v
 ```
 
 For local use without packaging, run `python -m gitws ...` from this directory.
+
+## Install
+
+On systems with an externally managed Python installation, use a virtual
+environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+ln -sfn "$PWD/.venv/bin/gitws" "$HOME/.local/bin/gitws"
+```
+
+Make sure `$HOME/.local/bin` is in `PATH`, then run `gitws --help` anywhere.
