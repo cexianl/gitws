@@ -81,11 +81,21 @@ Linux using `new --cow`:
 | Shared full-tree base | 4.00 GiB physical |
 | One workspace write layer | 304 KiB physical |
 
-Two independent full source copies would require about 32 GiB for the source
-tree alone in this sample. The COW workspaces use one shared base and small
-per-workspace write layers. The independent-clone comparison was calculated
-from the measured source tree size; its network time depends on the remote and
-was not presented as a benchmark.
+For five parallel workspaces, comparing task storage only and excluding the
+already existing original checkout:
+
+| Approach | Physical storage for five workspaces |
+| --- | ---: |
+| Five independent clones | about 87.1 GiB |
+| `gitws --cow` | about 5.43 GiB |
+| Saved by `gitws --cow` | about 81.7 GiB (93.8%) |
+
+The independent-clone figure is `5 × (16.01 GiB source + 0.81 GiB Git
+objects + 0.61 GiB LFS objects)`. The COW figure is one shared Git object
+store, one shared LFS store, one shared 4.00 GiB base, and five 304 KiB write
+layers. The write-layer value is a measured sample; actual tasks consume more
+or less space according to their changes. Clone network time depends on the
+remote and was not used as a fixed benchmark.
 
 ## Install
 
