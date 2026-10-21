@@ -61,6 +61,11 @@ class GitwsTests(unittest.TestCase):
         self.assertIn("workspace:a", result)
         self.assertGreater(result["total"]["logical"], 0)
 
+    def test_doctor_reports_healthy_workspace(self):
+        repo = self.store.add("demo", self.source)
+        self.store.create_workspace(repo, "doctor-a", None)
+        self.assertEqual(self.store.doctor(repo), [])
+
     def test_parallel_workspace_creation_is_serialized(self):
         repo = self.store.add("demo", self.source)
         first = run_git("rev-parse", "HEAD", cwd=self.source)

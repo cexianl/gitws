@@ -39,6 +39,7 @@ gitws new project task-a
 gitws new project task-b --at def456
 gitws status project
 gitws size project
+gitws doctor project
 gitws remove task-a
 gitws clean ptj1
 ```

@@ -22,6 +22,7 @@ gitws list
 gitws status [name]
 gitws remove <workspace>
 gitws size <name>
+gitws doctor <name>
 gitws clean <name>
 ```
 

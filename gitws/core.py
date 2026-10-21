@@ -255,12 +255,15 @@ class Store:
             record.unlink(missing_ok=True)
 
     def size(self, repo: Repo) -> dict[str, dict[str, int]]:
-        def measure(path: Path, seen: set[tuple[int, int]]) -> dict[str, int]:
+        def measure(path: Path, seen: set[tuple[int, int]], exclude_git: bool = False) -> dict[str, int]:
             logical = 0
             physical = 0
             if not path.exists():
                 return {"logical": 0, "physical": 0}
             for root, dirs, files in os.walk(path, followlinks=False):
+                if exclude_git and Path(root).name == ".git":
+                    dirs[:] = []
+                    continue
                 dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
                 for name in files:
                     file_path = Path(root) / name
@@ -276,14 +279,48 @@ class Store:
             return {"logical": logical, "physical": physical}
 
         seen: set[tuple[int, int]] = set()
-        result = {"mirror": measure(repo.mirror, seen), "source": measure(repo.path, seen)}
+        result = {"shared Git objects": measure(repo.mirror, seen),
+                  "original files": measure(repo.path, seen, exclude_git=True)}
         for item in self.workspaces(repo.name):
-            result[f"workspace:{item['name']}"] = measure(Path(item["path"]), seen)
+            result[f"workspace:{item['name']}"] = measure(Path(item["path"]), seen, exclude_git=True)
         result["total"] = {
             key: sum(value[key] for name, value in result.items() if name != "total")
             for key in ("logical", "physical")
         }
         return result
+
+    def doctor(self, repo: Repo) -> list[str]:
+        problems: list[str] = []
+        if not repo.path.exists():
+            problems.append(f"original repository is missing: {repo.path}")
+        else:
+            try:
+                ensure_repo(repo.path)
+            except GitwsError as exc:
+                problems.append(str(exc))
+        if not repo.mirror.is_dir():
+            problems.append(f"shared Git mirror is missing: {repo.mirror}")
+        else:
+            try:
+                if run_git("rev-parse", "--is-bare-repository", cwd=repo.mirror) != "true":
+                    problems.append(f"mirror is not bare: {repo.mirror}")
+            except GitwsError as exc:
+                problems.append(str(exc))
+        for item in self.workspaces(repo.name):
+            path = Path(item["path"])
+            if not path.is_dir():
+                problems.append(f"workspace is missing: {item['name']}")
+                continue
+            try:
+                current = run_git("rev-parse", "HEAD", cwd=path)
+                if current != item["commit"]:
+                    problems.append(f"workspace commit changed: {item['name']}")
+                for line in run_git("submodule", "status", "--recursive", cwd=path).splitlines():
+                    if line and line[0] in "+-U":
+                        problems.append(f"submodule is not pinned: {item['name']}: {line}")
+            except GitwsError as exc:
+                problems.append(f"workspace unavailable: {item['name']}: {exc}")
+        return problems
 
     def clean(self, repo: Repo) -> None:
         with self.locked("state"):

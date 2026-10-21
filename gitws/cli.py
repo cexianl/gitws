@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("size", help="show repository disk usage")
     p.add_argument("name")
     p.add_argument("--bytes", action="store_true", help="show exact byte counts")
+    p = sub.add_parser("doctor", help="check repository and workspace integrity")
+    p.add_argument("name")
     p = sub.add_parser("clean", help="prune stale records and mirror data")
     p.add_argument("name")
     return parser
@@ -139,10 +141,15 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     logical = human_size(value["logical"])
                     physical = human_size(value["physical"])
-                labels = {"mirror": "shared cache", "source": "original",
-                          "total": "total"}
-                label = labels.get(key, key.removeprefix("workspace:"))
+                label = key.removeprefix("workspace:")
                 print(f"{label}\tlogical={logical}\tphysical={physical}")
+        elif args.command == "doctor":
+            problems = store.doctor(repo)
+            if problems:
+                for problem in problems:
+                    print(f"problem: {problem}")
+                raise SystemExit(1)
+            print(f"ok {repo.name}")
         elif args.command == "clean":
             store.clean(repo)
             print(f"cleaned {repo.name}")
