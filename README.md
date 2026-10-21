@@ -17,6 +17,7 @@ gitws switch <name> <commit>
 gitws new <name> <workspace> [--at COMMIT]
 gitws path <workspace>
 gitws list
+gitws status [name]
 gitws remove <workspace>
 gitws size <name>
 gitws clean <name>
