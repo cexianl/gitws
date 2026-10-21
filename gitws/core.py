@@ -107,6 +107,34 @@ def submodule_urls(path: Path) -> dict[str, str]:
     return values
 
 
+def submodule_is_optional(path: Path, relative: str) -> bool:
+    """Return whether a missing recursive submodule is disabled or stale."""
+    for gitmodules in path.rglob(".gitmodules"):
+        parent = gitmodules.parent
+        try:
+            prefix = parent.relative_to(path)
+        except ValueError:
+            continue
+        output = run_git("config", "--file", str(gitmodules), "--get-regexp",
+                        r"^submodule\..*\.path$", cwd=parent, check=False)
+        for key, subpath in (line.split(None, 1) for line in output.splitlines()):
+            section = re.match(r"^submodule\.(.+)\.path$", key)
+            if not section:
+                continue
+            candidate = str(prefix / subpath) if str(prefix) != "." else subpath
+            if candidate != relative:
+                continue
+            update = run_git("config", "--file", str(gitmodules), "--get",
+                             f"submodule.{section.group(1)}.update", cwd=parent,
+                             check=False)
+            if update == "none":
+                return True
+            entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
+                            relative, cwd=path, check=False)
+            return not entry.startswith("160000 ")
+    return False
+
+
 def repo_id(remote: str) -> str:
     return hashlib.sha256(remote.encode()).hexdigest()[:16]
 
@@ -483,7 +511,11 @@ class Store:
                 if current != item["commit"]:
                     problems.append(f"workspace commit changed: {item['name']}")
                 for line in run_git("submodule", "status", "--recursive", cwd=path).splitlines():
-                    if line and line[0] in "+-U":
+                    parts = line[1:].split() if line else []
+                    subpath = parts[1] if len(parts) >= 2 else ""
+                    if (line and line[0] in "+U") or (
+                            line and line[0] == "-" and
+                            not submodule_is_optional(path, subpath)):
                         problems.append(f"submodule is not pinned: {item['name']}: {line}")
             except GitwsError as exc:
                 problems.append(f"workspace unavailable: {item['name']}: {exc}")
