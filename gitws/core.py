@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -183,11 +184,22 @@ class Store:
                 run_git("fetch", "--prune", "origin", cwd=mirror)
         return mirror
 
-    def update_submodules(self, path: Path) -> None:
-        run_git("submodule", "sync", "--recursive", cwd=path)
-        self._update_submodule_tree(path)
+    def lfs_path(self, repo: Repo) -> Path:
+        path = self.root / "lfs" / repo_id(repo.remote)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def _update_submodule_tree(self, path: Path) -> None:
+    @staticmethod
+    def _lfs_env() -> dict[str, str]:
+        env = os.environ.copy()
+        env["GIT_LFS_SKIP_SMUDGE"] = "1"
+        return env
+
+    def update_submodules(self, path: Path, env: dict[str, str] | None = None) -> None:
+        run_git("submodule", "sync", "--recursive", cwd=path, env=env)
+        self._update_submodule_tree(path, env)
+
+    def _update_submodule_tree(self, path: Path, env: dict[str, str] | None = None) -> None:
         # Initialize one child at a time so each clone gets its own mirror as
         # an explicit alternates/reference store. Nested .gitmodules become
         # visible only after their parent has been checked out.
@@ -196,11 +208,21 @@ class Store:
             run_git(
                 "-c", f"url.{mirror}.insteadOf={url}",
                 "submodule", "update", "--init", "--reference", str(mirror),
-                subpath, cwd=path,
+                subpath, cwd=path, env=env,
             )
             child = path / subpath
             if child.is_dir():
-                self._update_submodule_tree(child)
+                self._update_submodule_tree(child, env)
+
+    def pull_lfs(self, path: Path, storage: Path) -> None:
+        if shutil.which("git-lfs") is None:
+            return
+        run_git("config", "lfs.storage", str(storage), cwd=path)
+        run_git("lfs", "pull", cwd=path)
+        for subpath in submodule_urls(path):
+            child = path / subpath
+            if child.is_dir():
+                self.pull_lfs(child, storage)
 
     def latest(self, repo: Repo) -> str:
         self.sync_mirror(repo)
@@ -229,9 +251,13 @@ class Store:
             commit = commit or self.latest(repo)
             run_git("cat-file", "-e", f"{commit}^{{commit}}", cwd=repo.mirror)
             target.parent.mkdir(parents=True, exist_ok=True)
-            run_git("worktree", "add", "--detach", str(target), commit, cwd=repo.mirror)
+            lfs_storage = self.lfs_path(repo)
+            lfs_env = self._lfs_env()
+            run_git("worktree", "add", "--detach", str(target), commit,
+                    cwd=repo.mirror, env=lfs_env)
             try:
-                self.update_submodules(target)
+                self.update_submodules(target, lfs_env)
+                self.pull_lfs(target, lfs_storage)
                 item = {"name": name, "repo": repo.name, "path": str(target),
                         "commit": run_git("rev-parse", "HEAD", cwd=target),
                         "submodules": submodule_snapshot(target)}
@@ -279,7 +305,9 @@ class Store:
             return {"logical": logical, "physical": physical}
 
         seen: set[tuple[int, int]] = set()
+        lfs_path = self.root / "lfs" / repo_id(repo.remote)
         result = {"shared Git objects": measure(repo.mirror, seen),
+                  "shared LFS objects": measure(lfs_path, seen),
                   "original files": measure(repo.path, seen, exclude_git=True)}
         for item in self.workspaces(repo.name):
             result[f"workspace:{item['name']}"] = measure(Path(item["path"]), seen, exclude_git=True)

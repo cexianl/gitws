@@ -127,5 +127,17 @@ class GitwsTests(unittest.TestCase):
         self.assertEqual(alternates[0], alternates[1])
         self.assertIn(str(sub_mirror / "objects"), alternates[0])
 
+    def test_workspaces_share_lfs_storage_and_plain_repo_still_works(self):
+        repo = self.store.add("demo", self.source)
+        first = self.store.create_workspace(repo, "lfs-one", None)
+        second = self.store.create_workspace(repo, "lfs-two", first["commit"])
+
+        expected = str(self.store.lfs_path(repo))
+        for item in (first, second):
+            workspace = Path(item["path"])
+            self.assertEqual(expected, run_git("config", "--get", "lfs.storage", cwd=workspace))
+
+        self.assertTrue(Path(expected).is_dir())
+
 if __name__ == "__main__":
     unittest.main()

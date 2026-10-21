@@ -37,6 +37,8 @@ The state directory defaults to `~/.gitws` and can be changed with
 - `new` creates a detached worktree below the gitws state directory.
 - Each initialized submodule uses its matching mirror as a Git reference store;
   submodule objects are shared while working files remain isolated per workspace.
+- When Git LFS is installed, workspaces for the same repository use one shared
+  LFS object store; each workspace still has its own working files.
 - Removing a workspace only removes directories previously created by gitws.
 - A workspace records its exact superproject commit and recursive submodule SHAs.
 
@@ -49,7 +51,8 @@ primitive but leaves those surrounding concerns to the user.
 
 `gitws` does not replace Git. It calls native `git`, `git-lfs`, `worktree`, and
 `submodule` commands. Workspace source files remain separate so tasks can edit
-them independently; Git and submodule objects are shared.
+them independently; Git, submodule, and (when available) Git LFS objects are
+shared.
 
 ## Install
 
