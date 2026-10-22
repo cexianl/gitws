@@ -38,6 +38,10 @@ HEAD and pin recursive submodule commits. Later source updates do not change
 existing workspaces. Uncommitted edits, untracked files, and build outputs are
 not copied from the source.
 
+Use a different branch name for each task. Workspace `origin` points to the
+registered upstream; local sources without an upstream have no `origin`.
+Registering an existing alias with a different source is rejected.
+
 ## Commands
 
 | Command | Purpose |
@@ -49,8 +53,9 @@ not copied from the source.
 | `status [name]` | Show commits and local changes |
 | `usage <name> [--bytes]` | Show disk usage |
 | `remove <workspace>` | Remove a workspace, including its local changes |
+| `mount <workspace>` | Restore a COW mount, for example after a reboot |
 | `doctor <name>` | Check repository and workspace integrity |
-| `clean <name>` | Prune stale workspace records |
+| `clean <name> [--unused] [--dry-run]` | Prune stale records; optionally remove unused COW bases |
 | `sync <name>` | Switch the original checkout to the latest remote branch commit |
 | `switch <name> <commit>` | Switch the original checkout to a specific commit |
 
@@ -70,6 +75,20 @@ export GITWS_HOME=/data/gitws
 Ordinary workspaces have separate source files. `new --cow` also shares a full
 source tree and stores each workspace's changes separately. It requires
 OverlayFS or `fuse-overlayfs`; use `gitws remove` to unmount and delete it.
+After a reboot, run `gitws mount <workspace>` to restore the tree and its edits.
+
+Unused bases remain cached for reuse and are included in `usage`, along with
+submodule mirrors. Preview and reclaim unused bases with:
+
+```bash
+gitws clean project --unused --dry-run
+gitws clean project --unused
+```
+
+Bases referenced by existing workspaces are retained, including unmounted ones.
+Bases with locally stored submodule Git objects are also retained to protect task commits.
+Git and LFS object caches are retained. Different projects can create workspaces
+concurrently; operations on the same repository are serialized.
 
 `usage` reports file lengths (`logical`) and allocated file blocks (`physical`),
 including build outputs. Hard links count once toward physical usage.

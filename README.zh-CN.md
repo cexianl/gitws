@@ -35,6 +35,9 @@ git switch -c task-a
 `new --at <commit>` 可指定提交。工作区初始为 detached HEAD，递归子仓库固定到记录的
 commit。之后更新来源仓库不会改变已有工作区。未提交修改、未跟踪文件和构建产物不会从来源目录复制。
 
+每个任务使用不同的分支名。工作区的 `origin` 指向登记的上游仓库；本地来源未配置上游时，
+工作区也不设置 `origin`。已有别名不能重新登记为不同的来源。
+
 ## 命令
 
 | 命令 | 用途 |
@@ -46,8 +49,9 @@ commit。之后更新来源仓库不会改变已有工作区。未提交修改�
 | `status [name]` | 查看 commit 和修改状态 |
 | `usage <name> [--bytes]` | 查看磁盘占用 |
 | `remove <workspace>` | 删除工作区，包括其中的本地修改 |
+| `mount <workspace>` | 恢复 COW 挂载，例如重启后恢复工作区 |
 | `doctor <name>` | 检查仓库和工作区完整性 |
-| `clean <name>` | 清理失效的工作区记录 |
+| `clean <name> [--unused] [--dry-run]` | 清理失效记录，可选回收未使用的 COW 基础目录 |
 | `sync <name>` | 将原始仓库切换到远端分支的最新 commit |
 | `switch <name> <commit>` | 将原始仓库切换到指定 commit |
 
@@ -65,6 +69,18 @@ export GITWS_HOME=/data/gitws
 
 普通工作区各自保存源码。`new --cow` 还会共享完整源码目录，并分别保存各工作区的修改。
 需要 OverlayFS 或 `fuse-overlayfs`；使用 `gitws remove` 卸载并删除工作区。
+重启后，执行 `gitws mount <workspace>` 恢复目录及已有修改。
+
+未使用的基础目录会保留以供复用，并与子仓库镜像一起计入 `usage`。预览和回收未使用的基础目录：
+
+```bash
+gitws clean project --unused --dry-run
+gitws clean project --unused
+```
+
+仍被工作区引用的基础目录会保留，包括工作区尚未挂载的情况。
+包含子仓库本地 Git 对象的基础目录也会保留，以保护任务提交。Git 和 LFS 对象缓存会保留。
+不同项目可并发创建工作区，同一仓库的管理操作按顺序执行。
 
 `usage` 显示文件长度（`logical`）和实际分配的磁盘块（`physical`），包括构建产物。
 硬链接的物理占用只计算一次。结果逐项输出，`--bytes` 可显示精确字节数。

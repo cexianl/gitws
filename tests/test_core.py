@@ -1,15 +1,16 @@
-import json
 import io
+import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from gitws.core import GitwsError, Store, run_git
 from gitws.cli import human_size, main
+from gitws.core import GitwsError, Store, run_git
 
 
 class GitwsTests(unittest.TestCase):
@@ -34,6 +35,10 @@ class GitwsTests(unittest.TestCase):
         self.store = Store(self.root / "state")
 
     def tearDown(self):
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            target = line.split()[4].replace("\\040", " ").replace("\\134", "\\")
+            if target.startswith(str(self.root) + "/"):
+                subprocess.run(["umount", target], check=True, capture_output=True)
         if self.old_git_config is None:
             os.environ.pop("GIT_CONFIG_GLOBAL", None)
         else:
@@ -46,7 +51,9 @@ class GitwsTests(unittest.TestCase):
         item = self.store.create_workspace(repo, "a", first)
         self.assertEqual(first, item["commit"])
         self.assertTrue(Path(item["path"]).is_dir())
-        self.assertEqual(first, json.loads((self.store.records_dir / "a.json").read_text())["commit"])
+        self.assertEqual(
+            first, json.loads((self.store.records_dir / "a.json").read_text())["commit"]
+        )
 
     def test_local_source_never_contacts_remote_and_excludes_untracked_files(self):
         run_git("remote", "set-url", "origin", "ssh://invalid.example/repo.git", cwd=self.source)
@@ -149,9 +156,10 @@ class GitwsTests(unittest.TestCase):
         (self.source / "README").write_text("dirty\n")
         with self.assertRaises(GitwsError):
             from gitws.core import ensure_clean
+
             ensure_clean(repo.path)
 
-    def test_size_reports_total_and_workspace(self):
+    def test_usage_reports_total_and_workspace(self):
         repo = self.store.add("demo", self.source)
         first = run_git("rev-parse", "HEAD", cwd=self.source)
         self.store.create_workspace(repo, "a", first)
@@ -169,10 +177,12 @@ class GitwsTests(unittest.TestCase):
         repo = self.store.add("demo", self.source)
         first = run_git("rev-parse", "HEAD", cwd=self.source)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            items = list(pool.map(
-                lambda name: self.store.create_workspace(repo, name, first),
-                ("parallel-a", "parallel-b"),
-            ))
+            items = list(
+                pool.map(
+                    lambda name: self.store.create_workspace(repo, name, first),
+                    ("parallel-a", "parallel-b"),
+                )
+            )
         self.assertEqual({item["name"] for item in items}, {"parallel-a", "parallel-b"})
 
     def test_human_size(self):
@@ -202,17 +212,36 @@ class GitwsTests(unittest.TestCase):
         (main_source / "README").write_text("main\n")
         run_git("add", "README", cwd=main_source)
         run_git("commit", "-m", "main", cwd=main_source)
-        run_git("-c", "protocol.file.allow=always", "submodule", "add",
-                sub_remote.as_uri(), "modules/lib", cwd=main_source)
+        run_git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_remote.as_uri(),
+            "modules/lib",
+            cwd=main_source,
+        )
         run_git("commit", "-am", "add submodule", cwd=main_source)
         run_git("remote", "add", "origin", main_remote.as_uri(), cwd=main_source)
         run_git("push", "-u", "origin", "main", cwd=main_source)
         run_git("symbolic-ref", "HEAD", "refs/heads/main", cwd=main_remote)
 
-        url_setting = run_git("config", "--file", ".gitmodules", "--get-regexp",
-                              r"^submodule\..*\.url$", cwd=main_source).split()[0]
-        run_git("config", "--file", ".gitmodules", url_setting,
-                "ssh://invalid.example/submodule.git", cwd=main_source)
+        url_setting = run_git(
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.url$",
+            cwd=main_source,
+        ).split()[0]
+        run_git(
+            "config",
+            "--file",
+            ".gitmodules",
+            url_setting,
+            "ssh://invalid.example/submodule.git",
+            cwd=main_source,
+        )
         run_git("add", ".gitmodules", cwd=main_source)
         run_git("commit", "-m", "record unreachable submodule URL", cwd=main_source)
 
@@ -233,6 +262,8 @@ class GitwsTests(unittest.TestCase):
         self.assertEqual(alternates[0], alternates[1])
         self.assertIn(str(sub_mirror / "objects"), alternates[0])
 
+        if not (shutil.which("fuse-overlayfs") and Path("/dev/fuse").exists()):
+            return  # The ordinary submodule assertions above still run.
         cow = self.store.create_workspace(repo, "cow-submodule", first["commit"], cow=True)
         try:
             submodule_path = Path(cow["path"]) / "modules/lib"
@@ -254,8 +285,10 @@ class GitwsTests(unittest.TestCase):
 
         self.assertTrue(Path(expected).is_dir())
 
-    @unittest.skipUnless(shutil.which("fuse-overlayfs") or os.geteuid() == 0,
-                         "overlayfs or fuse-overlayfs is unavailable")
+    @unittest.skipUnless(
+        shutil.which("fuse-overlayfs") and Path("/dev/fuse").exists(),
+        "overlayfs or fuse-overlayfs is unavailable",
+    )
     def test_cow_workspace_has_full_tree_and_isolated_changes(self):
         repo = self.store.add("demo", self.source)
         first = self.store.create_workspace(repo, "cow-one", None, cow=True)
@@ -273,6 +306,7 @@ class GitwsTests(unittest.TestCase):
         self.assertIn("workspace:cow-one writes", usage)
         self.store.remove_workspace("cow-one")
         self.store.remove_workspace("cow-two")
+
 
 if __name__ == "__main__":
     unittest.main()

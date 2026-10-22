@@ -17,8 +17,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install Git LFS and COW dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs fuse-overlayfs
+          sudo modprobe fuse
+          test -c /dev/fuse
+          sudo chmod a+rw /dev/fuse
       - name: Install package
-        run: python -m pip install --upgrade pip && python -m pip install -e .
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+      - name: Check style
+        run: |
+          ruff check .
+          ruff format --check .
       - name: Compile sources
         run: python -m compileall -q gitws tests
       - name: Run tests

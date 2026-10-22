@@ -1,230 +1,87 @@
+"""Repository registration and workspace lifecycle orchestration.
+
+Store owns lock ordering and persisted records. Filesystem, Git, LFS and COW
+operations live in small modules that do not depend on Store.
+"""
+
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 import shutil
-import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None
-
-
-class GitwsError(RuntimeError):
-    pass
-
-
-def run_git(*args: str, cwd: Path | None = None, check: bool = True,
-            env: dict[str, str] | None = None) -> str:
-    proc = subprocess.run(
-        ["git", *args], cwd=cwd, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, env=env,
-    )
-    if check and proc.returncode:
-        detail = proc.stderr.strip() or proc.stdout.strip()
-        raise GitwsError(f"git {' '.join(args)} failed: {detail}")
-    return proc.stdout.strip()
-
-
-def run_command(*args: str, cwd: Path | None = None,
-                check: bool = True) -> str:
-    proc = subprocess.run(
-        list(args), cwd=cwd, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if check and proc.returncode:
-        detail = proc.stderr.strip() or proc.stdout.strip()
-        raise GitwsError(f"{' '.join(args)} failed: {detail}")
-    return proc.stdout.strip()
-
-
-def git_dir(path: Path) -> Path:
-    value = run_git("rev-parse", "--git-dir", cwd=path)
-    result = Path(value)
-    return result if result.is_absolute() else (path / result).resolve()
-
-
-def ensure_repo(path: Path) -> Path:
-    path = path.expanduser().resolve()
-    if not path.is_dir():
-        raise GitwsError(f"repository path does not exist: {path}")
-    return Path(run_git("rev-parse", "--show-toplevel", cwd=path)).resolve()
-
-
-def local_clone_option(path: Path) -> str:
-    alternates = Path(run_git("rev-parse", "--git-path",
-                              "objects/info/alternates", cwd=path))
-    if not alternates.is_absolute():
-        alternates = (path / alternates).resolve()
-    return "--no-local" if alternates.exists() else "--local"
-
-
-def ensure_clean(path: Path) -> None:
-    status = run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path)
-    if status:
-        raise GitwsError(f"repository has local changes: {path}")
-    for line in run_git("submodule", "status", "--recursive", cwd=path).splitlines():
-        if line and line[0] in "+-U":
-            raise GitwsError(f"submodule is not at the recorded clean commit: {line}")
-
-
-def submodule_snapshot(path: Path) -> dict[str, str]:
-    result: dict[str, str] = {}
-    output = run_git("submodule", "status", "--recursive", cwd=path)
-    for line in output.splitlines():
-        if not line:
-            continue
-        parts = line[1:].split()
-        if len(parts) >= 2:
-            result[parts[1]] = parts[0]
-    return result
-
-
-def submodule_urls(path: Path) -> dict[str, str]:
-    """Return submodule path -> URL entries declared by this checkout."""
-    gitmodules = path / ".gitmodules"
-    if not gitmodules.exists():
-        return {}
-    output = run_git("config", "--file", str(gitmodules), "--get-regexp",
-                    r"^submodule\..*\.url$", cwd=path, check=False)
-    values: dict[str, str] = {}
-    for line in output.splitlines():
-        key, url = line.split(None, 1)
-        match = re.match(r"^submodule\.(.+)\.url$", key)
-        if match:
-            section = match.group(1)
-            subpath = run_git("config", "--file", str(gitmodules), "--get",
-                              f"submodule.{section}.path", cwd=path)
-            index_entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
-                                  subpath, cwd=path, check=False)
-            if not index_entry.startswith("160000 "):
-                continue
-            values[subpath] = url
-    return values
-
-
-def submodule_is_optional(path: Path, relative: str) -> bool:
-    """Return whether a missing recursive submodule is disabled or stale."""
-    for gitmodules in path.rglob(".gitmodules"):
-        parent = gitmodules.parent
-        try:
-            prefix = parent.relative_to(path)
-        except ValueError:
-            continue
-        output = run_git("config", "--file", str(gitmodules), "--get-regexp",
-                        r"^submodule\..*\.path$", cwd=parent, check=False)
-        for key, subpath in (line.split(None, 1) for line in output.splitlines()):
-            section = re.match(r"^submodule\.(.+)\.path$", key)
-            if not section:
-                continue
-            candidate = str(prefix / subpath) if str(prefix) != "." else subpath
-            if candidate != relative:
-                continue
-            entry = run_git("ls-files", "--error-unmatch", "--stage", "--",
-                            relative, cwd=path, check=False)
-            return not entry.startswith("160000 ")
-    return False
-
-
-def submodule_update_override(path: Path, relative: str) -> str | None:
-    """Return a config override for submodules disabled by .gitmodules."""
-    gitmodules = path / ".gitmodules"
-    if not gitmodules.exists():
-        return None
-    output = run_git("config", "--file", str(gitmodules), "--get-regexp",
-                    r"^submodule\..*\.path$", cwd=path, check=False)
-    for key, subpath in (line.split(None, 1) for line in output.splitlines()):
-        if subpath != relative:
-            continue
-        match = re.match(r"^submodule\.(.+)\.path$", key)
-        if not match:
-            return None
-        section = match.group(1)
-        update = run_git("config", "--file", str(gitmodules), "--get",
-                         f"submodule.{section}.update", cwd=path, check=False)
-        if update == "none":
-            return f"submodule.{section}.update=checkout"
-        return None
-    return None
-
-
-def repo_id(remote: str) -> str:
-    return hashlib.sha256(remote.encode()).hexdigest()[:16]
-
-
-@dataclass
-class Repo:
-    name: str
-    path: Path | None
-    remote: str
-    branch: str
-    mirror: Path
-    source: str = "local"
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"path": str(self.path) if self.path else None, "remote": self.remote,
-                "branch": self.branch, "mirror": str(self.mirror), "source": self.source}
-
-
-def storage_id(repo: Repo) -> str:
-    return repo_id(repo.remote or f"local:{repo.path}")
+from . import cow as overlay
+from . import lfs
+from .cache import RepositoryCache
+from .errors import GitwsError
+from .git import (
+    common_git_dir,
+    ensure_clean,
+    ensure_repo,
+    run_git,
+    submodule_is_optional,
+    submodule_snapshot,
+)
+from .models import DiskUsage, Repo, WorkspaceRecord, storage_id
+from .process import run_command as run_command
+from .storage import locked, read_json, repo_id, write_json
+from .usage import measure_paths
 
 
 class Store:
-    def __init__(self, root: Path | None = None):
+    """Manage one storage root; create/remove lock workspace before repository."""
+
+    def __init__(self, root: Path | None = None) -> None:
         self.root = (root or Path(os.environ.get("GITWS_HOME", "~/.gitws"))).expanduser().resolve()
         self.repos_dir = self.root / "repos"
         self.workspaces_dir = self.root / "workspaces"
         self.records_dir = self.root / "records"
         self.bases_dir = self.root / "bases"
         self.cow_dir = self.root / "cow"
-        for directory in (self.repos_dir, self.workspaces_dir, self.records_dir,
-                          self.bases_dir, self.cow_dir):
+        for directory in (
+            self.repos_dir,
+            self.workspaces_dir,
+            self.records_dir,
+            self.bases_dir,
+            self.cow_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         self.config = self.root / "config.json"
-        self.state_lock_path = self.root / "state.lock"
-        self.mirror_lock_path = self.root / "mirror.lock"
+        self.cache = RepositoryCache(self.root)
 
     @contextmanager
-    def locked(self, kind: str = "state"):
-        lock_path = self.state_lock_path if kind == "state" else self.mirror_lock_path
-        lock_path.touch(exist_ok=True)
-        handle = lock_path.open("r+")
-        try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def locked(self, kind: str = "state") -> Iterator[None]:
+        with locked(self.root, kind):
             yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+
+    @staticmethod
+    def is_mounted(path: Path) -> bool:
+        return overlay.is_mounted(path)
 
     def _load(self) -> dict[str, Any]:
         if not self.config.exists():
             return {"repos": {}}
-        return json.loads(self.config.read_text())
+        return read_json(self.config)
 
     def _save(self, value: dict[str, Any]) -> None:
-        tmp = self.config.with_suffix(".tmp")
-        tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-        tmp.replace(self.config)
+        write_json(self.config, value)
 
     def get(self, name: str) -> Repo:
         raw = self._load().get("repos", {}).get(name)
         if not raw:
             raise GitwsError(f"unknown repository alias: {name}")
-        return Repo(name, Path(raw["path"]) if raw.get("path") else None,
-                    raw["remote"], raw["branch"], Path(raw["mirror"]),
-                    raw.get("source", "local"))
+        return Repo(
+            name,
+            Path(raw["path"]) if raw.get("path") else None,
+            raw["remote"],
+            raw["branch"],
+            Path(raw["mirror"]),
+            raw.get("source", "local"),
+        )
 
     def add(self, name: str, location: Path | str) -> Repo:
         if not name or "/" in name or name in {".", ".."}:
@@ -240,16 +97,27 @@ class Store:
         else:
             path = ensure_repo(Path(location))
             remote = run_git("remote", "get-url", "origin", cwd=path, check=False)
-            branch = run_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD",
-                             cwd=path, check=False).removeprefix("origin/")
+            branch = run_git(
+                "symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=path, check=False
+            ).removeprefix("origin/")
             branch = branch or run_git("branch", "--show-current", cwd=path)
             source = "local"
             identity = f"local:{path}"
         mirror = self.repos_dir / f"{repo_id(identity)}.git"
         with self.locked():
             data = self._load()
-            data.setdefault("repos", {})[name] = Repo(name, path, remote, branch, mirror,
-                                                       source).as_dict()
+            existing = data.get("repos", {}).get(name)
+            if existing:
+                if (
+                    existing.get("path") == (str(path) if path else None)
+                    and existing.get("source", "local") == source
+                    and (source == "local" or existing["remote"] == remote)
+                ):
+                    return self.get(name)
+                raise GitwsError(f"repository alias already exists: {name}")
+            data.setdefault("repos", {})[name] = Repo(
+                name, path, remote, branch, mirror, source
+            ).as_dict()
             self._save(data)
         return self.get(name)
 
@@ -257,177 +125,66 @@ class Store:
         return {name: self.get(name) for name in self._load().get("repos", {})}
 
     def sync_mirror(self, repo: Repo) -> None:
-        with self.locked("mirror"):
-            if repo.source == "local":
-                if repo.path and repo.path.is_dir():
-                    local_env = os.environ.copy()
-                    local_env["GIT_NO_LAZY_FETCH"] = "1"
-                    if not repo.mirror.exists():
-                        repo.mirror.parent.mkdir(parents=True, exist_ok=True)
-                        run_git("clone", "--mirror", local_clone_option(repo.path),
-                                str(repo.path),
-                                str(repo.mirror), env=local_env)
-                    else:
-                        run_git("fetch", "--prune", str(repo.path),
-                                "+refs/heads/*:refs/heads/*",
-                                "+refs/tags/*:refs/tags/*", cwd=repo.mirror,
-                                env=local_env)
-                    run_git("fetch", "--no-tags", str(repo.path),
-                            "+HEAD:refs/gitws/source-head", cwd=repo.mirror,
-                            env=local_env)
-                elif not repo.mirror.exists():
-                    raise GitwsError(f"local repository is missing: {repo.path}")
-            elif not repo.mirror.exists():
-                repo.mirror.parent.mkdir(parents=True, exist_ok=True)
-                run_git("clone", "--mirror", repo.remote, str(repo.mirror))
-            else:
-                run_git("fetch", "--prune", "origin", cwd=repo.mirror)
-            if shutil.which("git-lfs") is not None:
-                run_git("lfs", "install", "--local", cwd=repo.mirror)
+        self.cache.sync_mirror(repo)
 
-    def submodule_mirror(self, url: str, local_path: Path | None = None,
-                         local_only: bool = False) -> Path:
-        mirror = self.repos_dir / f"{repo_id(url)}.git"
-        with self.locked("mirror"):
-            if local_only:
-                if local_path and (local_path / ".git").exists():
-                    local_env = os.environ.copy()
-                    local_env["GIT_NO_LAZY_FETCH"] = "1"
-                    if not mirror.exists():
-                        run_git("clone", "--mirror", local_clone_option(local_path),
-                                str(local_path), str(mirror), env=local_env)
-                    else:
-                        run_git("fetch", str(local_path),
-                                "+refs/heads/*:refs/heads/*", cwd=mirror,
-                                env=local_env)
-                elif not mirror.exists():
-                    raise GitwsError(f"local submodule is unavailable: {local_path}")
-            elif not mirror.exists():
-                run_git("clone", "--mirror", url, str(mirror))
-            else:
-                run_git("fetch", "--prune", url,
-                        "+refs/heads/*:refs/heads/*",
-                        "+refs/tags/*:refs/tags/*", cwd=mirror)
-        return mirror
+    def submodule_caches(self, repo: Repo) -> list[Path]:
+        return self.cache.submodule_caches(repo)
 
     def lfs_path(self, repo: Repo) -> Path:
         path = self.root / "lfs" / storage_id(repo)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    @staticmethod
-    def _lfs_env() -> dict[str, str]:
-        env = os.environ.copy()
-        env["GIT_LFS_SKIP_SMUDGE"] = "1"
-        env["GIT_NO_LAZY_FETCH"] = "1"
-        return env
-
-    def update_submodules(self, path: Path, env: dict[str, str] | None = None,
-                          source_path: Path | None = None, local_only: bool = False) -> None:
-        run_git("submodule", "sync", "--recursive", cwd=path, env=env)
-        self._update_submodule_tree(path, env, source_path, local_only)
-
-    def _update_submodule_tree(self, path: Path, env: dict[str, str] | None = None,
-                               source_path: Path | None = None,
-                               local_only: bool = False) -> None:
-        # Initialize one child at a time so each clone gets its own mirror as
-        # an explicit alternates/reference store. Nested .gitmodules become
-        # visible only after their parent has been checked out.
-        for subpath, url in submodule_urls(path).items():
-            local_child = source_path / subpath if source_path else None
-            mirror = self.submodule_mirror(url, local_child, local_only)
-            override = submodule_update_override(path, subpath)
-            update_args = ["-c", override] if override else []
-            run_git(
-                *update_args, "-c", "protocol.file.allow=always",
-                "-c", f"url.{mirror.as_uri()}.insteadOf={url}",
-                "submodule", "update", "--init", "--reference", str(mirror),
-                subpath, cwd=path, env=env,
-            )
-            child = path / subpath
-            if child.is_dir():
-                self._update_submodule_tree(child, env, local_child, local_only)
-
-    def pull_lfs(self, path: Path, storage: Path) -> None:
-        if shutil.which("git-lfs") is None:
-            return
-        run_git("config", "lfs.storage", str(storage), cwd=path)
-        run_git("lfs", "pull", cwd=path)
-        for subpath in submodule_urls(path):
-            child = path / subpath
-            if child.is_dir():
-                self.pull_lfs(child, storage)
-
     def seed_local_lfs(self, source: Path | None, storage: Path) -> None:
-        if source is None or not source.is_dir() or shutil.which("git-lfs") is None:
-            return
-        details = run_git("lfs", "env", cwd=source)
-        media = next((line.split("=", 1)[1] for line in details.splitlines()
-                      if line.startswith("LocalMediaDir=")), "")
-        if media:
-            media_dir = Path(media)
-            if media_dir.is_dir():
-                for original in media_dir.rglob("*"):
-                    if not original.is_file():
-                        continue
-                    destination = storage / "objects" / original.relative_to(media_dir)
-                    if destination.exists():
-                        continue
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        os.link(original, destination)
-                    except OSError:
-                        shutil.copy2(original, destination)
-        for subpath in submodule_urls(source):
-            self.seed_local_lfs(source / subpath, storage)
+        with self.locked(f"lfs:{storage}"):
+            lfs.seed(source, storage)
 
-    def checkout_local_lfs(self, path: Path, storage: Path) -> None:
-        if shutil.which("git-lfs") is None:
-            return
-        run_git("config", "lfs.storage", str(storage), cwd=path)
-        for line in run_git("lfs", "ls-files", "--long", cwd=path).splitlines():
-            object_id = line.split(None, 1)[0]
-            if not re.fullmatch(r"[0-9a-f]{64}", object_id):
-                continue
-            object_path = storage / "objects" / object_id[:2] / object_id[2:4] / object_id
-            if not object_path.exists():
-                raise GitwsError(f"local Git LFS object is missing: {object_id}")
-        run_git("lfs", "checkout", cwd=path)
-        for subpath in submodule_urls(path):
-            child = path / subpath
-            if child.is_dir():
-                self.checkout_local_lfs(child, storage)
-
-    def latest(self, repo: Repo) -> str:
-        if repo.source == "local":
-            return run_git("rev-parse", "refs/gitws/source-head", cwd=repo.mirror)
-        branch = repo.branch or run_git("symbolic-ref", "--quiet", "--short", "HEAD",
-                                        cwd=repo.mirror)
-        return run_git("rev-parse", f"refs/heads/{branch}", cwd=repo.mirror)
-
-    def sync_remote(self, repo: Repo) -> str:
-        if not repo.remote or not repo.branch:
-            raise GitwsError("repository has no configured remote branch")
-        with self.locked("mirror"):
-            run_git("fetch", repo.remote,
-                    f"+refs/heads/{repo.branch}:refs/gitws/remote-head",
-                    cwd=repo.mirror)
-            return run_git("rev-parse", "refs/gitws/remote-head", cwd=repo.mirror)
+    def switch_source(self, repo: Repo, revision: str | None = None) -> str:
+        """Explicitly switch a clean original checkout; None selects remote latest."""
+        command = "sync" if revision is None else "switch"
+        if repo.path is None:
+            raise GitwsError(f"{command} requires a local repository")
+        if revision is None and not repo.remote:
+            raise GitwsError("local repository has no origin URL")
+        with self.locked(f"repo:{repo.mirror}"):
+            ensure_clean(repo.path)
+            self.sync_mirror(repo)
+            commit = (
+                self.cache.sync_remote(repo)
+                if revision is None
+                else self.cache.resolve_commit(repo, revision)
+            )
+            run_git("fetch", str(repo.mirror), commit, cwd=repo.path)
+            run_git("switch", "--detach", commit, cwd=repo.path)
+            self.cache.update_submodules(repo.path)
+        return commit
 
     def record_path(self, name: str) -> Path:
         return self.records_dir / f"{name}.json"
 
     def base_path(self, repo: Repo, commit: str) -> Path:
-        return self.bases_dir / storage_id(repo) / commit
+        legacy = self.bases_dir / storage_id(repo) / commit
+        if legacy.is_dir():
+            try:
+                if common_git_dir(legacy) == repo.mirror:
+                    return legacy
+            except GitwsError:
+                pass
+        return self.bases_dir / repo.mirror.stem / commit
 
-    @staticmethod
-    def _metadata_files(path: Path) -> list[Path]:
-        values: list[Path] = []
-        for root, dirs, files in os.walk(path):
-            dirs[:] = [name for name in dirs if name != ".git"]
-            if ".git" in files:
-                values.append(Path(root) / ".git")
-        return values
+    def retained_bases(self, repo: Repo) -> list[Path]:
+        values = {path for path in (self.bases_dir / repo.mirror.stem).glob("*") if path.is_dir()}
+        for path in (self.bases_dir / storage_id(repo)).glob("*"):
+            if path.is_dir():
+                try:
+                    if common_git_dir(path) == repo.mirror:
+                        values.add(path)
+                except GitwsError:
+                    continue
+        values.update(
+            Path(item["base"]) for item in self.workspaces(repo.name) if item.get("mode") == "cow"
+        )
+        return sorted(values)
 
     def _ensure_base(self, repo: Repo, commit: str, env: dict[str, str]) -> Path:
         base = self.base_path(repo, commit)
@@ -440,123 +197,70 @@ class Store:
                         incomplete = True
                         break
             if incomplete:
-                self.update_submodules(base, env, repo.path,
-                                       repo.source == "local")
+                if repo.source == "local":
+                    self.seed_local_lfs(repo.path, self.lfs_path(repo))
+                self.cache.update_submodules(base, env, repo.path, repo.source == "local")
                 if repo.source == "remote":
-                    self.pull_lfs(base, self.lfs_path(repo))
+                    lfs.pull(base, self.lfs_path(repo))
                 else:
-                    self.checkout_local_lfs(base, self.lfs_path(repo))
+                    lfs.checkout(base, self.lfs_path(repo))
             return base
         base.parent.mkdir(parents=True, exist_ok=True)
-        run_git("worktree", "add", "--detach", str(base), commit,
-                cwd=repo.mirror, env=env)
+        if repo.source == "local":
+            self.seed_local_lfs(repo.path, self.lfs_path(repo))
+        run_git("worktree", "add", "--detach", str(base), commit, cwd=repo.mirror, env=env)
         try:
-            self.update_submodules(base, env, repo.path, repo.source == "local")
+            self.cache.update_submodules(base, env, repo.path, repo.source == "local")
             run_git("config", "lfs.storage", str(self.lfs_path(repo)), cwd=base)
             if repo.source == "remote":
-                self.pull_lfs(base, self.lfs_path(repo))
+                lfs.pull(base, self.lfs_path(repo))
             else:
-                self.checkout_local_lfs(base, self.lfs_path(repo))
+                lfs.checkout(base, self.lfs_path(repo))
             return base
         except Exception:
-            run_git("worktree", "remove", "--force", str(base),
-                    cwd=repo.mirror, check=False)
+            run_git("worktree", "remove", "--force", str(base), cwd=repo.mirror, check=False)
             raise
 
-    def _prepare_cow_metadata(self, base: Path, target: Path, upper: Path,
-                              storage: Path) -> None:
-        """Create only Git metadata; source files come from the lower layer."""
-        run_git("worktree", "add", "--detach", "--no-checkout", str(target),
-                run_git("rev-parse", "HEAD", cwd=base), cwd=base)
-        run_git("reset", "--mixed", "HEAD", cwd=target)
-        run_git("config", "lfs.storage", str(storage), cwd=target)
-        metadata = target / ".git"
-        destination = upper / ".git"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(metadata, destination)
-        self._prepare_cow_children(base, target, upper, storage)
+    def mount_workspace(self, name: str) -> Path:
+        with self.workspace_locked(name) as (item, _):
+            record = self.record_path(name)
+            if item.get("mode") != "cow":
+                raise GitwsError(f"workspace does not use COW: {name}")
+            target = Path(item["path"])
+            if self.is_mounted(target):
+                return target
+            for key in ("path", "base", "upper", "work"):
+                if not Path(item[key]).is_dir():
+                    raise GitwsError(f"workspace {key} is missing: {item[key]}")
+            for root, dirs, files in os.walk(target):
+                if any(filename != ".git" for filename in files) or any(
+                    (Path(root) / directory).is_symlink() for directory in dirs
+                ):
+                    raise GitwsError(
+                        "files were written into the unmounted workspace; "
+                        "move them out before mounting"
+                    )
+            item["backend"] = overlay.mount(
+                Path(item["base"]), Path(item["upper"]), Path(item["work"]), target
+            )
+            write_json(record, item)
+            return target
 
-    def _prepare_cow_children(self, base: Path, target: Path, upper: Path,
-                              storage: Path) -> None:
-        entries = list(submodule_urls(base))
-
-        def prepare(subpath: str) -> None:
-            base_child = base / subpath
-            target_child = target / subpath
-            if not base_child.is_dir():
-                return
-            target_child.parent.mkdir(parents=True, exist_ok=True)
-            commit = run_git("rev-parse", "HEAD", cwd=base_child)
-            run_git("worktree", "add", "--detach", "--no-checkout",
-                    str(target_child), commit, cwd=base_child)
-            run_git("reset", "--mixed", "HEAD", cwd=target_child)
-            run_git("config", "lfs.storage", str(storage), cwd=target_child)
-            child_metadata = target_child / ".git"
-            child_destination = upper / subpath / ".git"
-            child_destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(child_metadata, child_destination)
-            self._prepare_cow_children(base_child, target_child, upper / subpath,
-                                       storage)
-
-        if len(entries) < 2:
-            for subpath in entries:
-                prepare(subpath)
-            return
-        with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
-            list(pool.map(prepare, entries))
-
-    def _remove_cow_metadata(self, base: Path, target: Path) -> None:
-        for subpath in submodule_urls(base):
-            base_child = base / subpath
-            target_child = target / subpath
-            if base_child.is_dir() and target_child.exists():
-                self._remove_cow_metadata(base_child, target_child)
-                run_git("worktree", "remove", "--force", str(target_child),
-                        cwd=base_child, check=False)
-
-    def _mount_cow(self, lower: Path, upper: Path, work: Path,
-                   target: Path) -> str:
-        options = f"lowerdir={lower},upperdir={upper},workdir={work}"
-        if os.geteuid() == 0 and shutil.which("mount"):
-            try:
-                run_command("mount", "-t", "overlay", "overlay", "-o", options,
-                            str(target))
-                return "overlayfs"
-            except GitwsError:
-                pass
-        fuse = shutil.which("fuse-overlayfs")
-        if fuse:
-            run_command(fuse, "-o", options, str(target))
-            return "fuse-overlayfs"
-        raise GitwsError("copy-on-write workspaces require overlayfs or fuse-overlayfs")
-
-    @staticmethod
-    def is_mounted(path: Path) -> bool:
-        try:
-            mounts = Path("/proc/self/mountinfo").read_text().splitlines()
-        except OSError:
-            return False
-        needle = str(path.resolve())
-        return any(f" {needle} " in line or line.endswith(f" {needle}") for line in mounts)
-
-    def _unmount_cow(self, target: Path) -> None:
-        if not self.is_mounted(target):
-            return
-        if shutil.which("umount") is None:
-            raise GitwsError("cannot remove copy-on-write workspace: umount is unavailable")
-        run_command("umount", str(target))
-
-    def workspaces(self, repo_name: str | None = None) -> list[dict[str, Any]]:
+    def workspaces(self, repo_name: str | None = None) -> list[WorkspaceRecord]:
         values = []
         for path in sorted(self.records_dir.glob("*.json")):
-            item = json.loads(path.read_text())
+            try:
+                item = read_json(path)
+            except FileNotFoundError:
+                continue  # A concurrent remove completed after glob().
             if repo_name is None or item["repo"] == repo_name:
                 values.append(item)
         return values
 
-    def create_workspace(self, repo: Repo, name: str, commit: str | None,
-                         cow: bool = False) -> dict[str, Any]:
-        with self.locked("state"):
+    def create_workspace(
+        self, repo: Repo, name: str, commit: str | None, cow: bool = False
+    ) -> WorkspaceRecord:
+        with self.locked(f"workspace:{name}"), self.locked(f"repo:{repo.mirror}"):
             if not name or "/" in name or name in {".", ".."}:
                 raise GitwsError("workspace name must be a simple name")
             record = self.record_path(name)
@@ -564,140 +268,163 @@ class Store:
             if record.exists() or target.exists():
                 raise GitwsError(f"workspace already exists: {name}")
             self.sync_mirror(repo)
-            commit = commit or self.latest(repo)
-            if repo.source == "local" and repo.path and repo.path.is_dir():
-                present = run_git("rev-parse", "--verify", f"{commit}^{{commit}}",
-                                  cwd=repo.mirror, check=False,
-                                  env=self._lfs_env())
-                if not present:
-                    run_git("fetch", str(repo.path), commit, cwd=repo.mirror,
-                            env=self._lfs_env())
-            commit = run_git("rev-parse", "--verify", f"{commit}^{{commit}}",
-                             cwd=repo.mirror)
+            revision = commit or self.cache.latest(repo)
+            try:
+                commit = self.cache.resolve_commit(repo, revision)
+            except GitwsError:
+                if repo.source != "local" or not repo.path or not repo.path.is_dir():
+                    raise
+                # Fetch a concrete object, never a revision expression/refspec.
+                commit = run_git(
+                    "rev-parse",
+                    "--verify",
+                    f"{revision}^{{commit}}",
+                    cwd=repo.path,
+                    env=lfs.environment(),
+                )
+                run_git(
+                    "fetch",
+                    "--no-tags",
+                    str(repo.path),
+                    commit,
+                    cwd=repo.mirror,
+                    env=lfs.environment(),
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             lfs_storage = self.lfs_path(repo)
-            lfs_env = self._lfs_env()
-            if repo.source == "local":
+            lfs_env = lfs.environment()
+            if repo.source == "local" and not cow:
                 self.seed_local_lfs(repo.path, lfs_storage)
             if cow:
-                base = self._ensure_base(repo, commit, lfs_env)
-                upper = self.cow_dir / name / "upper"
-                work = self.cow_dir / name / "work"
-                upper.mkdir(parents=True, exist_ok=True)
-                work.mkdir(parents=True, exist_ok=True)
-                try:
-                    self._prepare_cow_metadata(base, target, upper, lfs_storage)
-                    backend = self._mount_cow(base, upper, work, target)
-                    item = {"name": name, "repo": repo.name, "path": str(target),
-                            "commit": run_git("rev-parse", "HEAD", cwd=target),
-                            "submodules": submodule_snapshot(target),
-                            "mode": "cow", "backend": backend,
-                            "base": str(base), "upper": str(upper), "work": str(work)}
-                    record.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
-                    return item
-                except Exception:
-                    self._unmount_cow(target)
-                    self._remove_cow_metadata(base, target)
-                    run_git("worktree", "remove", "--force", str(target),
-                            cwd=repo.mirror, check=False)
-                    shutil.rmtree(self.cow_dir / name, ignore_errors=True)
-                    raise
-            run_git("worktree", "add", "--detach", str(target), commit,
-                    cwd=repo.mirror, env=lfs_env)
-            try:
-                self.update_submodules(target, lfs_env, repo.path,
-                                       repo.source == "local")
-                run_git("config", "lfs.storage", str(lfs_storage), cwd=target)
-                if repo.source == "remote":
-                    self.pull_lfs(target, lfs_storage)
-                else:
-                    self.checkout_local_lfs(target, lfs_storage)
-                item = {"name": name, "repo": repo.name, "path": str(target),
-                        "commit": run_git("rev-parse", "HEAD", cwd=target),
-                        "submodules": submodule_snapshot(target)}
-                record.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
-                return item
-            except Exception:
-                run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror, check=False)
-                raise
+                return self._create_cow_workspace(repo, name, commit, lfs_storage, lfs_env)
+            return self._create_worktree_workspace(repo, name, commit, lfs_storage, lfs_env)
 
-    def remove_workspace(self, name: str) -> None:
-        with self.locked("state"):
-            record = self.records_dir / f"{name}.json"
+    def _create_cow_workspace(
+        self, repo: Repo, name: str, commit: str, lfs_storage: Path, lfs_env: dict[str, str]
+    ) -> WorkspaceRecord:
+        """Create and record a workspace while the caller holds lifecycle locks."""
+        target = self.workspaces_dir / name
+        record = self.record_path(name)
+        base = self._ensure_base(repo, commit, lfs_env)
+        upper = self.cow_dir / name / "upper"
+        work = self.cow_dir / name / "work"
+        upper.mkdir(parents=True, exist_ok=True)
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            overlay.prepare_metadata(base, target, upper, lfs_storage)
+            backend = overlay.mount(base, upper, work, target)
+            item = {
+                "name": name,
+                "repo": repo.name,
+                "path": str(target),
+                "mirror": str(common_git_dir(target)),
+                "commit": run_git("rev-parse", "HEAD", cwd=target),
+                "submodules": submodule_snapshot(target),
+                "mode": "cow",
+                "backend": backend,
+                "base": str(base),
+                "upper": str(upper),
+                "work": str(work),
+            }
+            write_json(record, item)
+            return item
+        except Exception:
+            overlay.unmount(target)
+            overlay.remove_metadata(base, target)
+            run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror, check=False)
+            shutil.rmtree(self.cow_dir / name, ignore_errors=True)
+            raise
+
+    def _create_worktree_workspace(
+        self, repo: Repo, name: str, commit: str, lfs_storage: Path, lfs_env: dict[str, str]
+    ) -> WorkspaceRecord:
+        """Create and record a workspace while the caller holds lifecycle locks."""
+        target = self.workspaces_dir / name
+        record = self.record_path(name)
+        run_git("worktree", "add", "--detach", str(target), commit, cwd=repo.mirror, env=lfs_env)
+        try:
+            self.cache.update_submodules(target, lfs_env, repo.path, repo.source == "local")
+            run_git("config", "lfs.storage", str(lfs_storage), cwd=target)
+            if repo.source == "remote":
+                lfs.pull(target, lfs_storage)
+            else:
+                lfs.checkout(target, lfs_storage)
+            item = {
+                "name": name,
+                "repo": repo.name,
+                "path": str(target),
+                "mirror": str(repo.mirror),
+                "commit": run_git("rev-parse", "HEAD", cwd=target),
+                "submodules": submodule_snapshot(target),
+            }
+            write_json(record, item)
+            return item
+        except Exception:
+            run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror, check=False)
+            raise
+
+    @contextmanager
+    def workspace_locked(self, name: str) -> Iterator[tuple[WorkspaceRecord, Path]]:
+        # All lifecycle commands take workspace -> repository locks in this order.
+        with self.locked(f"workspace:{name}"):
+            record = self.record_path(name)
             if not record.exists():
                 raise GitwsError(f"unknown workspace: {name}")
-            item = json.loads(record.read_text())
+            item = read_json(record)
+            repo = self.get(item["repo"])
+            target = Path(item["path"]).resolve()
+            mirror = (
+                Path(item["mirror"])
+                if item.get("mirror")
+                else common_git_dir(target)
+                if (target / ".git").exists()
+                else repo.mirror
+            )
+            if mirror.parent != self.repos_dir:
+                raise GitwsError("workspace Git metadata is outside gitws storage")
+            with self.locked(f"repo:{mirror}"):
+                yield item, mirror
+
+    def remove_workspace(self, name: str) -> None:
+        with self.workspace_locked(name) as (item, mirror):
+            record = self.record_path(name)
             repo = self.get(item["repo"])
             target = Path(item["path"]).resolve()
             if self.workspaces_dir not in target.parents:
                 raise GitwsError("refusing to remove a path outside gitws workspaces")
             if item.get("mode") == "cow":
-                self._unmount_cow(target)
-                self._remove_cow_metadata(Path(item["base"]), target)
-            run_git("worktree", "remove", "--force", str(target), cwd=repo.mirror)
+                overlay.unmount(target)
+                overlay.remove_metadata(Path(item["base"]), target)
+            # Preserve knowledge of legacy submodule caches before metadata goes.
+            for cache in self.submodule_caches(repo):
+                self.cache.remember_submodule(repo.mirror, cache)
+            run_git("worktree", "remove", "--force", str(target), cwd=mirror)
             record.unlink(missing_ok=True)
             if item.get("mode") == "cow":
                 shutil.rmtree(self.cow_dir / name, ignore_errors=True)
 
-    def usage(self, repo: Repo) -> dict[str, dict[str, int]]:
+    def usage(self, repo: Repo) -> dict[str, DiskUsage]:
         return dict(self.iter_usage(repo))
 
-    def iter_usage(self, repo: Repo) -> Iterator[tuple[str, dict[str, int]]]:
-        """Measure live files, yielding each row as soon as its scan completes."""
-        def measure(path: Path, seen: set[tuple[int, int]], exclude_git: bool = False) -> dict[str, int]:
-            logical = 0
-            physical = 0
-            pending = [str(path)]
-            while pending:
-                directory = pending.pop()
-                try:
-                    with os.scandir(directory) as entries:
-                        children = []
-                        for entry in entries:
-                            try:
-                                if entry.is_dir(follow_symlinks=False):
-                                    if not (exclude_git and entry.name == ".git"):
-                                        children.append(entry.path)
-                                    continue
-                                stat = entry.stat(follow_symlinks=False)
-                            except OSError:
-                                # Files may disappear while a build is running.
-                                continue
-                            logical += stat.st_size
-                            identity = (stat.st_dev, stat.st_ino)
-                            if identity not in seen:
-                                seen.add(identity)
-                                blocks = getattr(stat, "st_blocks", None)
-                                physical += blocks * 512 if blocks is not None else stat.st_size
-                        pending.extend(reversed(children))
-                except OSError:
-                    continue
-            return {"logical": logical, "physical": physical}
+    def iter_usage(self, repo: Repo) -> Iterator[tuple[str, DiskUsage]]:
+        """Measure each row when requested, without scanning mounted COW trees."""
 
         def paths() -> Iterator[tuple[str, Path, bool]]:
             yield "shared Git objects", repo.mirror, False
+            for cache in self.submodule_caches(repo):
+                yield f"shared submodule:{cache.stem}", cache, False
             yield "shared LFS objects", self.root / "lfs" / storage_id(repo), False
             if repo.path:
                 yield "original checkout", repo.path, True
-            cow_bases: set[str] = set()
+            for base in self.retained_bases(repo):
+                yield f"shared base:{base.name}", base, True
             for item in self.workspaces(repo.name):
                 if item.get("mode") == "cow":
-                    base = Path(item["base"])
-                    if str(base) not in cow_bases:
-                        yield f"shared base:{base.name}", base, True
-                        cow_bases.add(str(base))
                     yield f"workspace:{item['name']} writes", Path(item["upper"]), True
                 else:
                     yield f"workspace:{item['name']}", Path(item["path"]), True
 
-        seen: set[tuple[int, int]] = set()
-        total = {"logical": 0, "physical": 0}
-        for label, path, exclude_git in paths():
-            value = measure(path, seen, exclude_git)
-            for key in total:
-                total[key] += value[key]
-            yield label, value
-        yield "total", total
+        yield from measure_paths(paths())
 
     def doctor(self, repo: Repo) -> list[str]:
         problems: list[str] = []
@@ -726,25 +453,40 @@ class Store:
                 if item.get("mode") == "cow" and not self.is_mounted(path):
                     problems.append(f"workspace is not mounted: {item['name']}")
                     continue
-                current = run_git("rev-parse", "HEAD", cwd=path)
-                if current != item["commit"]:
-                    problems.append(f"workspace commit changed: {item['name']}")
+                run_git("rev-parse", "--verify", "HEAD^{commit}", cwd=path)
                 for line in run_git("submodule", "status", "--recursive", cwd=path).splitlines():
                     parts = line[1:].split() if line else []
                     subpath = parts[1] if len(parts) >= 2 else ""
                     if (line and line[0] in "+U") or (
-                            line and line[0] == "-" and
-                            not submodule_is_optional(path, subpath)):
+                        line and line[0] == "-" and not submodule_is_optional(path, subpath)
+                    ):
                         problems.append(f"submodule is not pinned: {item['name']}: {line}")
             except GitwsError as exc:
                 problems.append(f"workspace unavailable: {item['name']}: {exc}")
         return problems
 
-    def clean(self, repo: Repo) -> None:
-        with self.locked("state"):
+    def clean(self, repo: Repo, unused: bool = False, dry_run: bool = False) -> list[Path]:
+        with self.locked(f"repo:{repo.mirror}"):
+            removed: list[Path] = []
+            if unused:
+                used = {item["base"] for item in self.workspaces() if item.get("mode") == "cow"}
+                for base in self.retained_bases(repo):
+                    if str(base) in used or self.is_mounted(base):
+                        continue
+                    if overlay.has_private_submodule_data(base):
+                        continue
+                    if not dry_run:
+                        owner = common_git_dir(base)
+                        if owner.parent != self.repos_dir:
+                            raise GitwsError("base Git metadata is outside gitws storage")
+                        for cache in self.submodule_caches(repo):
+                            self.cache.remember_submodule(repo.mirror, cache)
+                        run_git("worktree", "remove", "--force", str(base), cwd=owner)
+                    removed.append(base)
             for item in self.workspaces(repo.name):
                 path = Path(item["path"])
-                if not path.exists():
+                if not dry_run and not path.exists() and item.get("mode") != "cow":
                     self.record_path(item["name"]).unlink(missing_ok=True)
-            if repo.mirror.exists():
+            if not dry_run and repo.mirror.exists():
                 run_git("worktree", "prune", cwd=repo.mirror)
+            return removed

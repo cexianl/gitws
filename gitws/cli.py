@@ -1,10 +1,15 @@
+"""Command-line argument parsing and presentation."""
+
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
 
-from .core import GitwsError, Store, ensure_clean, run_git
+from .core import Store
+from .errors import GitwsError
+from .git import run_git
+from .models import Repo
 
 
 def human_size(value: int) -> str:
@@ -21,8 +26,9 @@ def human_size(value: int) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gitws", description="Small Git workspace manager")
-    parser.add_argument("--home", type=Path,
-                        help="store mirrors and workspaces under this directory")
+    parser.add_argument(
+        "--home", type=Path, help="store mirrors and workspaces under this directory"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("add", help="register a local repository or remote URL")
@@ -39,8 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("workspace")
     p.add_argument("--at", dest="commit")
-    p.add_argument("--cow", action="store_true",
-                   help="use a copy-on-write OverlayFS workspace")
+    p.add_argument("--cow", action="store_true", help="use a copy-on-write OverlayFS workspace")
 
     sub.add_parser("list", help="list repositories and workspaces")
     p = sub.add_parser("status", help="show repository and workspace status")
@@ -49,17 +54,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("workspace")
     p = sub.add_parser("remove", help="remove a workspace")
     p.add_argument("workspace")
+    p = sub.add_parser("mount", help="restore a COW workspace mount")
+    p.add_argument("workspace")
     p = sub.add_parser("usage", help="show repository disk usage")
     p.add_argument("name")
     p.add_argument("--bytes", action="store_true", help="show exact byte counts")
     p = sub.add_parser("doctor", help="check repository and workspace integrity")
     p.add_argument("name")
-    p = sub.add_parser("clean", help="prune stale records and mirror data")
+    p = sub.add_parser("clean", help="prune stale records and optionally unused bases")
     p.add_argument("name")
+    p.add_argument("--unused", action="store_true", help="remove unused COW bases")
+    p.add_argument("--dry-run", action="store_true", help="preview without removing data")
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
+    # Accept --home before or after the subcommand, preserving the last value.
     raw = list(sys.argv[1:] if argv is None else argv)
     homes: list[Path] = []
     filtered: list[str] = []
@@ -76,115 +86,114 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(filtered)
     if homes:
         args.home = homes[-1]
-    store = Store(args.home)
-    try:
-        if args.command == "add":
-            repo = store.add(args.name, args.source)
-            print(f"added {repo.name}: {repo.path or repo.remote}")
-            return
-        if args.command == "list":
-            for repo in store.all_repos().values():
-                print(f"{repo.name}  {repo.path or repo.remote}")
-                items = store.workspaces(repo.name)
-                if not items:
-                    print("  (no workspaces)")
-                for item in items:
-                    print(f"  {item['name']}  {item['commit'][:12]}  {item['path']}")
-            return
-        if args.command == "status":
-            repos = store.all_repos()
-            if args.name:
-                repos = {args.name: store.get(args.name)}
-            for repo in repos.values():
-                print(f"{repo.name}  {repo.path or repo.remote}")
-                if repo.path:
-                    try:
-                        commit = run_git("rev-parse", "--short", "HEAD", cwd=repo.path)
-                        dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=repo.path))
-                        print(f"  original  {commit}  {'modified' if dirty else 'clean'}")
-                    except GitwsError as exc:
-                        print(f"  original  unavailable ({exc})")
-                items = store.workspaces(repo.name)
-                if not items:
-                    print("  (no workspaces)")
-                for item in items:
-                    path = Path(item["path"])
-                    if item.get("mode") == "cow" and not store.is_mounted(path):
-                        current = item["commit"][:12]
-                        state = "not mounted"
-                    elif path.exists():
-                        try:
-                            current = run_git("rev-parse", "--short", "HEAD", cwd=path)
-                            dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
-                            state = "modified" if dirty else "clean"
-                        except GitwsError:
-                            current = item["commit"][:12]
-                            state = "unavailable"
-                    else:
-                        current = item["commit"][:12]
-                        state = "missing"
-                    print(f"  {item['name']}  {current}  {state}  {path}")
-            return
-        if args.command == "path":
-            items = {item["name"]: item for item in store.workspaces()}
-            item = items.get(args.workspace)
-            if not item:
-                raise GitwsError(f"unknown workspace: {args.workspace}")
-            print(item["path"])
-            return
-        if args.command == "remove":
-            store.remove_workspace(args.workspace)
-            print(f"removed {args.workspace}")
-            return
+    return args
 
-        repo = store.get(args.name)
-        if args.command == "sync":
-            if repo.path is None:
-                raise GitwsError("sync requires a local repository")
-            if not repo.remote:
-                raise GitwsError("local repository has no origin URL")
-            with store.locked("state"):
-                ensure_clean(repo.path)
-                store.sync_mirror(repo)
-                commit = store.sync_remote(repo)
-                run_git("fetch", str(repo.mirror), commit, cwd=repo.path)
-                run_git("switch", "--detach", commit, cwd=repo.path)
-                store.update_submodules(repo.path)
-            print(commit)
-        elif args.command == "switch":
-            if repo.path is None:
-                raise GitwsError("switch requires a local repository")
-            with store.locked("state"):
-                ensure_clean(repo.path)
-                store.sync_mirror(repo)
-                run_git("cat-file", "-e", f"{args.commit}^{{commit}}", cwd=repo.mirror)
-                run_git("fetch", str(repo.mirror), args.commit, cwd=repo.path)
-                run_git("switch", "--detach", args.commit, cwd=repo.path)
-                store.update_submodules(repo.path)
-            print(args.commit)
-        elif args.command == "new":
-            item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
-            print(item["path"])
-        elif args.command == "usage":
-            for key, value in store.iter_usage(repo):
-                if args.bytes:
-                    logical = str(value["logical"])
-                    physical = str(value["physical"])
-                else:
-                    logical = human_size(value["logical"])
-                    physical = human_size(value["physical"])
-                label = key.removeprefix("workspace:")
-                print(f"{label}\tlogical={logical}\tphysical={physical}", flush=True)
-        elif args.command == "doctor":
-            problems = store.doctor(repo)
-            if problems:
-                for problem in problems:
-                    print(f"problem: {problem}")
-                raise SystemExit(1)
-            print(f"ok {repo.name}")
-        elif args.command == "clean":
-            store.clean(repo)
+
+def _checkout_status(path: Path) -> tuple[str, str]:
+    commit = run_git("rev-parse", "--short", "HEAD", cwd=path)
+    dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=path))
+    return commit, "modified" if dirty else "clean"
+
+
+def _show_list(store: Store) -> None:
+    for repo in store.all_repos().values():
+        print(f"{repo.name}  {repo.path or repo.remote}")
+        items = store.workspaces(repo.name)
+        if not items:
+            print("  (no workspaces)")
+        for item in items:
+            print(f"  {item['name']}  {item['commit'][:12]}  {item['path']}")
+
+
+def _show_status(store: Store, name: str | None) -> None:
+    repos = {name: store.get(name)} if name else store.all_repos()
+    for repo in repos.values():
+        print(f"{repo.name}  {repo.path or repo.remote}")
+        if repo.path:
+            try:
+                commit, state = _checkout_status(repo.path)
+                print(f"  original  {commit}  {state}")
+            except GitwsError as exc:
+                print(f"  original  unavailable ({exc})")
+        items = store.workspaces(repo.name)
+        if not items:
+            print("  (no workspaces)")
+        for item in items:
+            path = Path(item["path"])
+            current = item["commit"][:12]
+            if item.get("mode") == "cow" and not store.is_mounted(path):
+                state = "not mounted"
+            elif not path.exists():
+                state = "missing"
+            else:
+                try:
+                    current, state = _checkout_status(path)
+                except GitwsError:
+                    state = "unavailable"
+            print(f"  {item['name']}  {current}  {state}  {path}")
+
+
+def _show_usage(store: Store, repo: Repo, raw_bytes: bool) -> None:
+    for key, value in store.iter_usage(repo):
+        format_size = str if raw_bytes else human_size
+        logical = format_size(value["logical"])
+        physical = format_size(value["physical"])
+        label = key.removeprefix("workspace:")
+        print(f"{label}\tlogical={logical}\tphysical={physical}", flush=True)
+
+
+def _execute(store: Store, args: argparse.Namespace) -> None:
+    if args.command == "add":
+        repo = store.add(args.name, args.source)
+        print(f"added {repo.name}: {repo.path or repo.remote}")
+        return
+    if args.command == "list":
+        _show_list(store)
+        return
+    if args.command == "status":
+        _show_status(store, args.name)
+        return
+    if args.command == "path":
+        item = next((item for item in store.workspaces() if item["name"] == args.workspace), None)
+        if item is None:
+            raise GitwsError(f"unknown workspace: {args.workspace}")
+        print(item["path"])
+        return
+    if args.command == "remove":
+        store.remove_workspace(args.workspace)
+        print(f"removed {args.workspace}")
+        return
+    if args.command == "mount":
+        print(store.mount_workspace(args.workspace))
+        return
+
+    repo = store.get(args.name)
+    if args.command == "sync":
+        print(store.switch_source(repo))
+    elif args.command == "switch":
+        print(store.switch_source(repo, args.commit))
+    elif args.command == "new":
+        item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
+        print(item["path"])
+    elif args.command == "usage":
+        _show_usage(store, repo, args.bytes)
+    elif args.command == "doctor":
+        problems = store.doctor(repo)
+        if problems:
+            for problem in problems:
+                print(f"problem: {problem}")
+            raise SystemExit(1)
+        print(f"ok {repo.name}")
+    elif args.command == "clean":
+        for path in store.clean(repo, args.unused, args.dry_run):
+            print(f"{'would remove' if args.dry_run else 'removed'} {path}")
+        if not args.dry_run:
             print(f"cleaned {repo.name}")
-    except GitwsError as exc:
-        raise SystemExit(f"gitws: error: {exc}") from exc
 
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_arguments(argv)
+    try:
+        _execute(Store(args.home), args)
+    except (GitwsError, OSError) as exc:
+        raise SystemExit(f"gitws: error: {exc}") from exc

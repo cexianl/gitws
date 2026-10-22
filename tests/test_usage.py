@@ -17,8 +17,13 @@ class UsageTests(unittest.TestCase):
         self.source = self.root / "source"
         self.source.mkdir()
         self.store = Store(self.root / "store")
-        self.repo = Repo("project", self.source, "https://example.test/repo.git",
-                         "main", self.store.repos_dir / "project.git")
+        self.repo = Repo(
+            "project",
+            self.source,
+            "https://example.test/repo.git",
+            "main",
+            self.store.repos_dir / "project.git",
+        )
 
     def test_symlinks_count_the_link_and_never_follow_the_target(self):
         outside = self.root / "outside"
@@ -67,7 +72,7 @@ class UsageTests(unittest.TestCase):
             scanned.append(Path(path))
             return scandir(path)
 
-        with patch("gitws.core.os.scandir", side_effect=track):
+        with patch("gitws.usage.os.scandir", side_effect=track):
             measured = self.store.usage(self.repo)["original checkout"]
         self.assertEqual(output.stat().st_size, measured["logical"])
         self.assertNotIn(git, scanned)
@@ -81,9 +86,15 @@ class UsageTests(unittest.TestCase):
             upper = self.store.cow_dir / name / "upper"
             upper.mkdir(parents=True)
             (upper / "edited").write_bytes(name.encode())
-            workspaces.append({"name": name, "mode": "cow", "base": str(base),
-                               "path": str(self.root / "mounted" / name),
-                               "upper": str(upper)})
+            workspaces.append(
+                {
+                    "name": name,
+                    "mode": "cow",
+                    "base": str(base),
+                    "path": str(self.root / "mounted" / name),
+                    "upper": str(upper),
+                }
+            )
         scanned = []
         scandir = os.scandir
 
@@ -91,8 +102,10 @@ class UsageTests(unittest.TestCase):
             scanned.append(Path(path))
             return scandir(path)
 
-        with patch.object(self.store, "workspaces", return_value=workspaces), \
-                patch("gitws.core.os.scandir", side_effect=track):
+        with (
+            patch.object(self.store, "workspaces", return_value=workspaces),
+            patch("gitws.usage.os.scandir", side_effect=track),
+        ):
             rows = self.store.usage(self.repo)
         self.assertEqual(1, scanned.count(base))
         self.assertFalse(any(self.root / "mounted" in p.parents for p in scanned))
@@ -128,9 +141,11 @@ class UsageTests(unittest.TestCase):
             self.assertGreater(output.flushes, 0)
             yield "total", {"logical": 1024, "physical": 4096}
 
-        with patch("gitws.cli.Store", return_value=self.store), \
-                patch.object(self.store, "get", return_value=self.repo), \
-                patch.object(self.store, "iter_usage", side_effect=rows), \
-                patch("sys.stdout", output):
+        with (
+            patch("gitws.cli.Store", return_value=self.store),
+            patch.object(self.store, "get", return_value=self.repo),
+            patch.object(self.store, "iter_usage", side_effect=rows),
+            patch("sys.stdout", output),
+        ):
             main(["usage", "project", "--bytes"])
         self.assertIn("total\tlogical=1024\tphysical=4096", output.getvalue())
