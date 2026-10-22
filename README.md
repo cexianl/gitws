@@ -2,10 +2,10 @@
 
 [中文文档](README.zh-CN.md)
 
-`gitws` is a small, local-only CLI for creating isolated Git workspaces from
-named repositories. It keeps its mirrors and workspaces outside the original
-repository, pins each workspace to one commit, and never runs cleanup commands
-against the original checkout.
+`gitws` is a small CLI for creating isolated Git workspaces from named local
+repositories or remote URLs. It keeps its mirrors and workspaces outside the
+original repository, pins each workspace to one commit, and never runs cleanup
+commands against the original checkout.
 
 `usage` reports logical bytes and physical bytes. Physical totals deduplicate
 shared files, so shared files are not counted repeatedly.
@@ -13,7 +13,7 @@ shared files, so shared files are not counted repeatedly.
 ## Commands
 
 ```text
-gitws add <name> <path>
+gitws add <name> <path-or-url>
 gitws sync <name>
 gitws switch <name> <commit>
 gitws new <name> <workspace> [--at COMMIT] [--cow]
@@ -25,6 +25,19 @@ gitws usage <name>
 gitws doctor <name>
 gitws clean <name>
 ```
+
+For a local path, `new` defaults to the source repository's current `HEAD` and
+uses only local Git objects, initialized submodules, and available LFS objects.
+It never fetches from the remote. The first workspace seeds an independent
+Git object store from the local repository; untracked, ignored, and build files
+in the source checkout are excluded. Use `--at` for another locally available
+commit. Cached commits remain usable after the original directory is removed.
+
+For a URL, `new` fetches remote updates and defaults to the remote's default
+branch. HTTPS, SSH, and `file://` URLs are accepted. `sync` and `switch` apply
+only to local path sources and explicitly change the registered checkout.
+Offline local work requires the needed submodule and LFS objects to already be
+present locally; missing objects are not downloaded.
 
 The state directory defaults to `~/.gitws` and can be changed with
 `GITWS_HOME`.
@@ -40,9 +53,22 @@ The `--home` option takes precedence over `GITWS_HOME`.
 `--cow` is an optional Linux feature. Remove these workspaces with `gitws
 remove` so their filesystem mounts can be unmounted cleanly.
 
+## Disk usage
+
+`gitws usage <name>` scans current files and prints each row as soon as it is
+ready. It includes untracked files and build outputs in checkouts. For COW
+workspaces, each shared base is scanned once per invocation, followed by each
+workspace's write layer; the mounted full trees are not scanned again.
+
+`logical` reports file lengths; `physical` reports allocated file blocks, with
+hard links counted once across rows. Symbolic links are measured without
+following their targets, and sparse files use their allocated blocks. Results
+are not cached, so large trees still take time to scan; concurrent builds can
+change files while a scan is running. Use `--bytes` for exact byte counts.
+
 ## Safety model
 
-- `add` only records the canonical path, remote URL, and branch.
+- `add` only records the local path or remote URL and does not modify the source.
 - `sync` and `switch` are the only commands that modify the registered checkout.
 - Both refuse dirty repositories and dirty submodules.
 - `new` creates a detached worktree below the gitws state directory.

@@ -8,7 +8,7 @@
 ## 解决的问题
 
 多个任务处理大型仓库时，反复 clone 会重复占用 Git 历史、Git LFS 和子仓库
-对象。`gitws` 在原始仓库之外维护 mirror，并从固定 commit 创建隔离工作区。
+对象。`gitws` 在独立存储目录中维护共享 Git 对象，并从固定 commit 创建隔离工作区。
 
 主仓库和递归子仓库的 Git 对象共享，普通工作区的源码文件和编译产物仍然各自独立。
 安装了 Git LFS 时，同一项目的工作区还会共享 LFS 对象存储；工作区中的源码文件仍然独立。
@@ -42,6 +42,7 @@ gitws --home /data/gitws new project task-a --cow
 
 ```bash
 gitws add project /path/to/project
+gitws add upstream https://github.com/example/project.git
 gitws sync project
 gitws switch project 5323e011d
 gitws new project task-a
@@ -51,8 +52,29 @@ gitws status project
 gitws usage project
 gitws doctor project
 gitws remove task-a
-gitws clean ptj1
+gitws clean project
 ```
+
+本地路径来源默认使用该仓库当前的 `HEAD`；`new` 只读取本机的 Git 对象、已初始化
+子仓库和现有 LFS 对象，不访问远端。首次建立共享对象仓库会进行本地 Git 复制，
+不会复制原目录中的未跟踪文件、忽略文件或构建产物。也可通过 `--at` 指定本机已有的
+commit。对象缓存建立后，即使原始目录被删除，已缓存的 commit 仍可创建工作区。
+
+URL 来源默认同步远端默认分支；可使用 HTTPS、SSH 或 `file://` URL。每次 `new`
+会获取远端更新，再将工作区固定到选定 commit。`sync` 和 `switch` 仅适用于
+本地路径来源，用于明确修改原始仓库。离线使用本地来源时，所需子仓库和 LFS
+对象必须已在本机；缺少的对象不会从远端补取。
+
+## 磁盘占用
+
+`gitws usage <name>` 实时扫描文件，每统计完一项就立即输出。原始目录和工作区中的
+未跟踪文件、构建产物也计入占用。对于 COW 工作区，每次命令只扫描一次各共享基础
+目录，再分别统计各工作区写层；不会重复扫描挂载后的完整目录树。
+
+`logical` 表示文件长度，`physical` 表示文件实际分配的磁盘块，跨统计项的硬链接
+只计算一次物理占用。软链接只统计链接本身，稀疏文件按实际分配的磁盘块计算。
+结果不缓存，因此大型目录仍需要扫描时间；同时进行的构建可能在扫描期间改变文件。
+使用 `--bytes` 可以输出精确字节数。
 
 ## 与原生 `git worktree` 的区别
 
@@ -74,7 +96,7 @@ gitws clean ptj1
 
 ## 安全边界
 
-- `add` 只记录原始仓库路径、远程地址和默认分支。
+- `add` 只记录本地路径或远程 URL；不会修改来源仓库。
 - 只有 `sync` 和 `switch` 会修改原始仓库。
 - 修改原始仓库前会检查未提交修改和子仓库状态。
 - `new` 在 `~/.gitws/workspaces` 下创建 detached 工作区。

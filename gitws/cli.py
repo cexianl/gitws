@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .core import GitwsError, Store, ensure_clean, ensure_repo, run_git
+from .core import GitwsError, Store, ensure_clean, run_git
 
 
 def human_size(value: int) -> str:
@@ -25,9 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="store mirrors and workspaces under this directory")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("add", help="register a local repository")
+    p = sub.add_parser("add", help="register a local repository or remote URL")
     p.add_argument("name")
-    p.add_argument("path", type=Path)
+    p.add_argument("source")
 
     p = sub.add_parser("sync", help="switch the registered checkout to remote latest")
     p.add_argument("name")
@@ -79,12 +79,12 @@ def main(argv: list[str] | None = None) -> None:
     store = Store(args.home)
     try:
         if args.command == "add":
-            repo = store.add(args.name, args.path)
-            print(f"added {repo.name}: {repo.path}")
+            repo = store.add(args.name, args.source)
+            print(f"added {repo.name}: {repo.path or repo.remote}")
             return
         if args.command == "list":
             for repo in store.all_repos().values():
-                print(f"{repo.name}  {repo.path}")
+                print(f"{repo.name}  {repo.path or repo.remote}")
                 items = store.workspaces(repo.name)
                 if not items:
                     print("  (no workspaces)")
@@ -96,13 +96,14 @@ def main(argv: list[str] | None = None) -> None:
             if args.name:
                 repos = {args.name: store.get(args.name)}
             for repo in repos.values():
-                print(f"{repo.name}  {repo.path}")
-                try:
-                    commit = run_git("rev-parse", "--short", "HEAD", cwd=repo.path)
-                    dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=repo.path))
-                    print(f"  original  {commit}  {'modified' if dirty else 'clean'}")
-                except GitwsError as exc:
-                    print(f"  original  unavailable ({exc})")
+                print(f"{repo.name}  {repo.path or repo.remote}")
+                if repo.path:
+                    try:
+                        commit = run_git("rev-parse", "--short", "HEAD", cwd=repo.path)
+                        dirty = bool(run_git("status", "--porcelain", "--ignore-submodules=none", cwd=repo.path))
+                        print(f"  original  {commit}  {'modified' if dirty else 'clean'}")
+                    except GitwsError as exc:
+                        print(f"  original  unavailable ({exc})")
                 items = store.workspaces(repo.name)
                 if not items:
                     print("  (no workspaces)")
@@ -138,18 +139,26 @@ def main(argv: list[str] | None = None) -> None:
 
         repo = store.get(args.name)
         if args.command == "sync":
+            if repo.path is None:
+                raise GitwsError("sync requires a local repository")
+            if not repo.remote:
+                raise GitwsError("local repository has no origin URL")
             with store.locked("state"):
                 ensure_clean(repo.path)
                 store.sync_mirror(repo)
-                commit = store.latest(repo)
+                commit = store.sync_remote(repo)
+                run_git("fetch", str(repo.mirror), commit, cwd=repo.path)
                 run_git("switch", "--detach", commit, cwd=repo.path)
                 store.update_submodules(repo.path)
             print(commit)
         elif args.command == "switch":
+            if repo.path is None:
+                raise GitwsError("switch requires a local repository")
             with store.locked("state"):
                 ensure_clean(repo.path)
                 store.sync_mirror(repo)
                 run_git("cat-file", "-e", f"{args.commit}^{{commit}}", cwd=repo.mirror)
+                run_git("fetch", str(repo.mirror), args.commit, cwd=repo.path)
                 run_git("switch", "--detach", args.commit, cwd=repo.path)
                 store.update_submodules(repo.path)
             print(args.commit)
@@ -157,7 +166,7 @@ def main(argv: list[str] | None = None) -> None:
             item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
             print(item["path"])
         elif args.command == "usage":
-            for key, value in store.usage(repo).items():
+            for key, value in store.iter_usage(repo):
                 if args.bytes:
                     logical = str(value["logical"])
                     physical = str(value["physical"])
@@ -165,7 +174,7 @@ def main(argv: list[str] | None = None) -> None:
                     logical = human_size(value["logical"])
                     physical = human_size(value["physical"])
                 label = key.removeprefix("workspace:")
-                print(f"{label}\tlogical={logical}\tphysical={physical}")
+                print(f"{label}\tlogical={logical}\tphysical={physical}", flush=True)
         elif args.command == "doctor":
             problems = store.doctor(repo)
             if problems:

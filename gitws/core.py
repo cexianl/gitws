@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -56,8 +57,15 @@ def ensure_repo(path: Path) -> Path:
     path = path.expanduser().resolve()
     if not path.is_dir():
         raise GitwsError(f"repository path does not exist: {path}")
-    run_git("rev-parse", "--show-toplevel", cwd=path)
-    return path
+    return Path(run_git("rev-parse", "--show-toplevel", cwd=path)).resolve()
+
+
+def local_clone_option(path: Path) -> str:
+    alternates = Path(run_git("rev-parse", "--git-path",
+                              "objects/info/alternates", cwd=path))
+    if not alternates.is_absolute():
+        alternates = (path / alternates).resolve()
+    return "--no-local" if alternates.exists() else "--local"
 
 
 def ensure_clean(path: Path) -> None:
@@ -156,14 +164,19 @@ def repo_id(remote: str) -> str:
 @dataclass
 class Repo:
     name: str
-    path: Path
+    path: Path | None
     remote: str
     branch: str
     mirror: Path
+    source: str = "local"
 
     def as_dict(self) -> dict[str, Any]:
-        return {"path": str(self.path), "remote": self.remote,
-                "branch": self.branch, "mirror": str(self.mirror)}
+        return {"path": str(self.path) if self.path else None, "remote": self.remote,
+                "branch": self.branch, "mirror": str(self.mirror), "source": self.source}
+
+
+def storage_id(repo: Repo) -> str:
+    return repo_id(repo.remote or f"local:{repo.path}")
 
 
 class Store:
@@ -209,23 +222,34 @@ class Store:
         raw = self._load().get("repos", {}).get(name)
         if not raw:
             raise GitwsError(f"unknown repository alias: {name}")
-        return Repo(name, Path(raw["path"]), raw["remote"], raw["branch"],
-                    Path(raw["mirror"]))
+        return Repo(name, Path(raw["path"]) if raw.get("path") else None,
+                    raw["remote"], raw["branch"], Path(raw["mirror"]),
+                    raw.get("source", "local"))
 
-    def add(self, name: str, path: Path) -> Repo:
+    def add(self, name: str, location: Path | str) -> Repo:
         if not name or "/" in name or name in {".", ".."}:
             raise GitwsError("repository alias must be a simple name")
-        path = ensure_repo(path)
-        remote = run_git("remote", "get-url", "origin", cwd=path)
-        branch = run_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=path,
-                         check=False)
-        branch = branch.removeprefix("origin/") or run_git("branch", "--show-current", cwd=path)
-        if not branch:
-            branch = "main"
-        mirror = self.repos_dir / f"{repo_id(remote)}.git"
+        value = str(location)
+        is_url = "://" in value or bool(re.match(r"^[^/]+@?[^/]*:[^/].*", value))
+        if is_url:
+            path = None
+            remote = value
+            branch = ""
+            source = "remote"
+            identity = f"remote:{remote}"
+        else:
+            path = ensure_repo(Path(location))
+            remote = run_git("remote", "get-url", "origin", cwd=path, check=False)
+            branch = run_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+                             cwd=path, check=False).removeprefix("origin/")
+            branch = branch or run_git("branch", "--show-current", cwd=path)
+            source = "local"
+            identity = f"local:{path}"
+        mirror = self.repos_dir / f"{repo_id(identity)}.git"
         with self.locked():
             data = self._load()
-            data.setdefault("repos", {})[name] = Repo(name, path, remote, branch, mirror).as_dict()
+            data.setdefault("repos", {})[name] = Repo(name, path, remote, branch, mirror,
+                                                       source).as_dict()
             self._save(data)
         return self.get(name)
 
@@ -234,23 +258,60 @@ class Store:
 
     def sync_mirror(self, repo: Repo) -> None:
         with self.locked("mirror"):
-            if not repo.mirror.exists():
+            if repo.source == "local":
+                if repo.path and repo.path.is_dir():
+                    local_env = os.environ.copy()
+                    local_env["GIT_NO_LAZY_FETCH"] = "1"
+                    if not repo.mirror.exists():
+                        repo.mirror.parent.mkdir(parents=True, exist_ok=True)
+                        run_git("clone", "--mirror", local_clone_option(repo.path),
+                                str(repo.path),
+                                str(repo.mirror), env=local_env)
+                    else:
+                        run_git("fetch", "--prune", str(repo.path),
+                                "+refs/heads/*:refs/heads/*",
+                                "+refs/tags/*:refs/tags/*", cwd=repo.mirror,
+                                env=local_env)
+                    run_git("fetch", "--no-tags", str(repo.path),
+                            "+HEAD:refs/gitws/source-head", cwd=repo.mirror,
+                            env=local_env)
+                elif not repo.mirror.exists():
+                    raise GitwsError(f"local repository is missing: {repo.path}")
+            elif not repo.mirror.exists():
                 repo.mirror.parent.mkdir(parents=True, exist_ok=True)
                 run_git("clone", "--mirror", repo.remote, str(repo.mirror))
             else:
                 run_git("fetch", "--prune", "origin", cwd=repo.mirror)
+            if shutil.which("git-lfs") is not None:
+                run_git("lfs", "install", "--local", cwd=repo.mirror)
 
-    def submodule_mirror(self, url: str) -> Path:
+    def submodule_mirror(self, url: str, local_path: Path | None = None,
+                         local_only: bool = False) -> Path:
         mirror = self.repos_dir / f"{repo_id(url)}.git"
         with self.locked("mirror"):
-            if not mirror.exists():
+            if local_only:
+                if local_path and (local_path / ".git").exists():
+                    local_env = os.environ.copy()
+                    local_env["GIT_NO_LAZY_FETCH"] = "1"
+                    if not mirror.exists():
+                        run_git("clone", "--mirror", local_clone_option(local_path),
+                                str(local_path), str(mirror), env=local_env)
+                    else:
+                        run_git("fetch", str(local_path),
+                                "+refs/heads/*:refs/heads/*", cwd=mirror,
+                                env=local_env)
+                elif not mirror.exists():
+                    raise GitwsError(f"local submodule is unavailable: {local_path}")
+            elif not mirror.exists():
                 run_git("clone", "--mirror", url, str(mirror))
             else:
-                run_git("fetch", "--prune", "origin", cwd=mirror)
+                run_git("fetch", "--prune", url,
+                        "+refs/heads/*:refs/heads/*",
+                        "+refs/tags/*:refs/tags/*", cwd=mirror)
         return mirror
 
     def lfs_path(self, repo: Repo) -> Path:
-        path = self.root / "lfs" / repo_id(repo.remote)
+        path = self.root / "lfs" / storage_id(repo)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -258,18 +319,23 @@ class Store:
     def _lfs_env() -> dict[str, str]:
         env = os.environ.copy()
         env["GIT_LFS_SKIP_SMUDGE"] = "1"
+        env["GIT_NO_LAZY_FETCH"] = "1"
         return env
 
-    def update_submodules(self, path: Path, env: dict[str, str] | None = None) -> None:
+    def update_submodules(self, path: Path, env: dict[str, str] | None = None,
+                          source_path: Path | None = None, local_only: bool = False) -> None:
         run_git("submodule", "sync", "--recursive", cwd=path, env=env)
-        self._update_submodule_tree(path, env)
+        self._update_submodule_tree(path, env, source_path, local_only)
 
-    def _update_submodule_tree(self, path: Path, env: dict[str, str] | None = None) -> None:
+    def _update_submodule_tree(self, path: Path, env: dict[str, str] | None = None,
+                               source_path: Path | None = None,
+                               local_only: bool = False) -> None:
         # Initialize one child at a time so each clone gets its own mirror as
         # an explicit alternates/reference store. Nested .gitmodules become
         # visible only after their parent has been checked out.
         for subpath, url in submodule_urls(path).items():
-            mirror = self.submodule_mirror(url)
+            local_child = source_path / subpath if source_path else None
+            mirror = self.submodule_mirror(url, local_child, local_only)
             override = submodule_update_override(path, subpath)
             update_args = ["-c", override] if override else []
             run_git(
@@ -280,7 +346,7 @@ class Store:
             )
             child = path / subpath
             if child.is_dir():
-                self._update_submodule_tree(child, env)
+                self._update_submodule_tree(child, env, local_child, local_only)
 
     def pull_lfs(self, path: Path, storage: Path) -> None:
         if shutil.which("git-lfs") is None:
@@ -292,15 +358,67 @@ class Store:
             if child.is_dir():
                 self.pull_lfs(child, storage)
 
+    def seed_local_lfs(self, source: Path | None, storage: Path) -> None:
+        if source is None or not source.is_dir() or shutil.which("git-lfs") is None:
+            return
+        details = run_git("lfs", "env", cwd=source)
+        media = next((line.split("=", 1)[1] for line in details.splitlines()
+                      if line.startswith("LocalMediaDir=")), "")
+        if media:
+            media_dir = Path(media)
+            if media_dir.is_dir():
+                for original in media_dir.rglob("*"):
+                    if not original.is_file():
+                        continue
+                    destination = storage / "objects" / original.relative_to(media_dir)
+                    if destination.exists():
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(original, destination)
+                    except OSError:
+                        shutil.copy2(original, destination)
+        for subpath in submodule_urls(source):
+            self.seed_local_lfs(source / subpath, storage)
+
+    def checkout_local_lfs(self, path: Path, storage: Path) -> None:
+        if shutil.which("git-lfs") is None:
+            return
+        run_git("config", "lfs.storage", str(storage), cwd=path)
+        for line in run_git("lfs", "ls-files", "--long", cwd=path).splitlines():
+            object_id = line.split(None, 1)[0]
+            if not re.fullmatch(r"[0-9a-f]{64}", object_id):
+                continue
+            object_path = storage / "objects" / object_id[:2] / object_id[2:4] / object_id
+            if not object_path.exists():
+                raise GitwsError(f"local Git LFS object is missing: {object_id}")
+        run_git("lfs", "checkout", cwd=path)
+        for subpath in submodule_urls(path):
+            child = path / subpath
+            if child.is_dir():
+                self.checkout_local_lfs(child, storage)
+
     def latest(self, repo: Repo) -> str:
-        self.sync_mirror(repo)
-        return run_git("rev-parse", f"refs/heads/{repo.branch}", cwd=repo.mirror)
+        if repo.source == "local":
+            return run_git("rev-parse", "refs/gitws/source-head", cwd=repo.mirror)
+        branch = repo.branch or run_git("symbolic-ref", "--quiet", "--short", "HEAD",
+                                        cwd=repo.mirror)
+        return run_git("rev-parse", f"refs/heads/{branch}", cwd=repo.mirror)
+
+    def sync_remote(self, repo: Repo) -> str:
+        if not repo.remote or not repo.branch:
+            raise GitwsError("repository has no configured remote branch")
+        with self.locked("mirror"):
+            run_git("fetch", repo.remote,
+                    f"+refs/heads/{repo.branch}:refs/gitws/remote-head",
+                    cwd=repo.mirror)
+            return run_git("rev-parse", "refs/gitws/remote-head", cwd=repo.mirror)
 
     def record_path(self, name: str) -> Path:
         return self.records_dir / f"{name}.json"
 
     def base_path(self, repo: Repo, commit: str) -> Path:
-        return self.bases_dir / repo_id(repo.remote) / commit
+        return self.bases_dir / storage_id(repo) / commit
 
     @staticmethod
     def _metadata_files(path: Path) -> list[Path]:
@@ -322,15 +440,23 @@ class Store:
                         incomplete = True
                         break
             if incomplete:
-                self.update_submodules(base, env)
-                self.pull_lfs(base, self.lfs_path(repo))
+                self.update_submodules(base, env, repo.path,
+                                       repo.source == "local")
+                if repo.source == "remote":
+                    self.pull_lfs(base, self.lfs_path(repo))
+                else:
+                    self.checkout_local_lfs(base, self.lfs_path(repo))
             return base
         base.parent.mkdir(parents=True, exist_ok=True)
         run_git("worktree", "add", "--detach", str(base), commit,
                 cwd=repo.mirror, env=env)
         try:
-            self.update_submodules(base, env)
-            self.pull_lfs(base, self.lfs_path(repo))
+            self.update_submodules(base, env, repo.path, repo.source == "local")
+            run_git("config", "lfs.storage", str(self.lfs_path(repo)), cwd=base)
+            if repo.source == "remote":
+                self.pull_lfs(base, self.lfs_path(repo))
+            else:
+                self.checkout_local_lfs(base, self.lfs_path(repo))
             return base
         except Exception:
             run_git("worktree", "remove", "--force", str(base),
@@ -439,11 +565,20 @@ class Store:
                 raise GitwsError(f"workspace already exists: {name}")
             self.sync_mirror(repo)
             commit = commit or self.latest(repo)
+            if repo.source == "local" and repo.path and repo.path.is_dir():
+                present = run_git("rev-parse", "--verify", f"{commit}^{{commit}}",
+                                  cwd=repo.mirror, check=False,
+                                  env=self._lfs_env())
+                if not present:
+                    run_git("fetch", str(repo.path), commit, cwd=repo.mirror,
+                            env=self._lfs_env())
             commit = run_git("rev-parse", "--verify", f"{commit}^{{commit}}",
                              cwd=repo.mirror)
             target.parent.mkdir(parents=True, exist_ok=True)
             lfs_storage = self.lfs_path(repo)
             lfs_env = self._lfs_env()
+            if repo.source == "local":
+                self.seed_local_lfs(repo.path, lfs_storage)
             if cow:
                 base = self._ensure_base(repo, commit, lfs_env)
                 upper = self.cow_dir / name / "upper"
@@ -470,8 +605,13 @@ class Store:
             run_git("worktree", "add", "--detach", str(target), commit,
                     cwd=repo.mirror, env=lfs_env)
             try:
-                self.update_submodules(target, lfs_env)
-                self.pull_lfs(target, lfs_storage)
+                self.update_submodules(target, lfs_env, repo.path,
+                                       repo.source == "local")
+                run_git("config", "lfs.storage", str(lfs_storage), cwd=target)
+                if repo.source == "remote":
+                    self.pull_lfs(target, lfs_storage)
+                else:
+                    self.checkout_local_lfs(target, lfs_storage)
                 item = {"name": name, "repo": repo.name, "path": str(target),
                         "commit": run_git("rev-parse", "HEAD", cwd=target),
                         "submodules": submodule_snapshot(target)}
@@ -500,61 +640,75 @@ class Store:
                 shutil.rmtree(self.cow_dir / name, ignore_errors=True)
 
     def usage(self, repo: Repo) -> dict[str, dict[str, int]]:
+        return dict(self.iter_usage(repo))
+
+    def iter_usage(self, repo: Repo) -> Iterator[tuple[str, dict[str, int]]]:
+        """Measure live files, yielding each row as soon as its scan completes."""
         def measure(path: Path, seen: set[tuple[int, int]], exclude_git: bool = False) -> dict[str, int]:
             logical = 0
             physical = 0
-            if not path.exists():
-                return {"logical": 0, "physical": 0}
-            for root, dirs, files in os.walk(path, followlinks=False):
-                if exclude_git and Path(root).name == ".git":
-                    dirs[:] = []
+            pending = [str(path)]
+            while pending:
+                directory = pending.pop()
+                try:
+                    with os.scandir(directory) as entries:
+                        children = []
+                        for entry in entries:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    if not (exclude_git and entry.name == ".git"):
+                                        children.append(entry.path)
+                                    continue
+                                stat = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                # Files may disappear while a build is running.
+                                continue
+                            logical += stat.st_size
+                            identity = (stat.st_dev, stat.st_ino)
+                            if identity not in seen:
+                                seen.add(identity)
+                                blocks = getattr(stat, "st_blocks", None)
+                                physical += blocks * 512 if blocks is not None else stat.st_size
+                        pending.extend(reversed(children))
+                except OSError:
                     continue
-                dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
-                for name in files:
-                    file_path = Path(root) / name
-                    try:
-                        stat = file_path.stat()
-                    except OSError:
-                        continue
-                    logical += stat.st_size
-                    identity = (stat.st_dev, stat.st_ino)
-                    if identity not in seen:
-                        seen.add(identity)
-                        physical += stat.st_blocks * 512 if stat.st_blocks else stat.st_size
             return {"logical": logical, "physical": physical}
 
+        def paths() -> Iterator[tuple[str, Path, bool]]:
+            yield "shared Git objects", repo.mirror, False
+            yield "shared LFS objects", self.root / "lfs" / storage_id(repo), False
+            if repo.path:
+                yield "original checkout", repo.path, True
+            cow_bases: set[str] = set()
+            for item in self.workspaces(repo.name):
+                if item.get("mode") == "cow":
+                    base = Path(item["base"])
+                    if str(base) not in cow_bases:
+                        yield f"shared base:{base.name}", base, True
+                        cow_bases.add(str(base))
+                    yield f"workspace:{item['name']} writes", Path(item["upper"]), True
+                else:
+                    yield f"workspace:{item['name']}", Path(item["path"]), True
+
         seen: set[tuple[int, int]] = set()
-        lfs_path = self.root / "lfs" / repo_id(repo.remote)
-        result = {"shared Git objects": measure(repo.mirror, seen),
-                  "shared LFS objects": measure(lfs_path, seen),
-                  "original checkout": measure(repo.path, seen, exclude_git=True)}
-        cow_bases: set[str] = set()
-        for item in self.workspaces(repo.name):
-            if item.get("mode") == "cow":
-                base = Path(item["base"])
-                if str(base) not in cow_bases:
-                    result[f"shared base:{base.name}"] = measure(base, seen, exclude_git=True)
-                    cow_bases.add(str(base))
-                result[f"workspace:{item['name']} writes"] = measure(
-                    Path(item["upper"]), seen, exclude_git=True)
-            else:
-                result[f"workspace:{item['name']}"] = measure(
-                    Path(item["path"]), seen, exclude_git=True)
-        result["total"] = {
-            key: sum(value[key] for name, value in result.items() if name != "total")
-            for key in ("logical", "physical")
-        }
-        return result
+        total = {"logical": 0, "physical": 0}
+        for label, path, exclude_git in paths():
+            value = measure(path, seen, exclude_git)
+            for key in total:
+                total[key] += value[key]
+            yield label, value
+        yield "total", total
 
     def doctor(self, repo: Repo) -> list[str]:
         problems: list[str] = []
-        if not repo.path.exists():
-            problems.append(f"original repository is missing: {repo.path}")
-        else:
-            try:
-                ensure_repo(repo.path)
-            except GitwsError as exc:
-                problems.append(str(exc))
+        if repo.path is not None:
+            if not repo.path.exists():
+                problems.append(f"original repository is missing: {repo.path}")
+            else:
+                try:
+                    ensure_repo(repo.path)
+                except GitwsError as exc:
+                    problems.append(str(exc))
         if not repo.mirror.is_dir():
             problems.append(f"shared Git mirror is missing: {repo.mirror}")
         else:
