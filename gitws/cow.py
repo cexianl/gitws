@@ -42,6 +42,7 @@ def _prepare_children(base: Path, target: Path, upper: Path, storage: Path) -> N
         if not base_child.is_dir():
             return
         target_child.parent.mkdir(parents=True, exist_ok=True)
+        _isolate_worktree_config(base_child)
         commit = run_git("rev-parse", "HEAD", cwd=base_child)
         run_git(
             "worktree",
@@ -66,6 +67,18 @@ def _prepare_children(base: Path, target: Path, upper: Path, storage: Path) -> N
         return
     with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
         list(pool.map(prepare, entries))
+
+
+def _isolate_worktree_config(path: Path) -> None:
+    """Keep the base submodule's checkout path out of its shared config."""
+    if not run_git("config", "--local", "--get", "core.worktree", cwd=path, check=False):
+        return
+    # submodule update rewrites a shared core.worktree relative to the task's
+    # gitdir, which breaks the base checkout. Only the base needs this setting;
+    # linked worktrees discover their own paths from their private metadata.
+    run_git("config", "extensions.worktreeConfig", "true", cwd=path)
+    run_git("config", "--worktree", "core.worktree", str(path), cwd=path)
+    run_git("config", "--local", "--unset", "core.worktree", cwd=path)
 
 
 def remove_metadata(base: Path, target: Path) -> None:
