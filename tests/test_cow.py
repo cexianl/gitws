@@ -45,7 +45,7 @@ class CowTests(RepositoryTestCase):
         self.assertEqual("edited\n", (target / "file").read_text())
         self.assertEqual("build output\n", (target / "untracked").read_text())
         self.assertIn("file", run_git("diff", "--cached", "--name-only", cwd=target))
-        self.store.remove_workspace("task")
+        self.store.remove_workspace("task", force=True)
         self.assertFalse(target.exists())
 
     @unittest.skipUnless(HAS_COW, "fuse-overlayfs is unavailable")
@@ -59,7 +59,7 @@ class CowTests(RepositoryTestCase):
         cow.unmount(Path(two["path"]))
         self.assertEqual([], self.store.clean(self.repo, unused=True))
         self.assertTrue(base.is_dir())
-        self.store.remove_workspace("b")
+        self.store.remove_workspace("b", force=True)
         self.assertTrue(base.is_dir())
         usage = self.store.usage(self.repo)
         self.assertTrue(any(key.startswith("shared base:") for key in usage))
@@ -129,6 +129,7 @@ class CowTests(RepositoryTestCase):
         child = Path(item["path"]) / "lib"
         run_git("switch", "-c", "task", cwd=child)
         commit = self.commit(child, "task commit\n")
+        run_git("commit", "-am", "record child commit", cwd=Path(item["path"]))
         self.store.remove_workspace("a")
         self.assertEqual([], self.store.clean(self.repo, unused=True))
         self.assertEqual(commit, run_git("rev-parse", "task", cwd=Path(item["base"]) / "lib"))

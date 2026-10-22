@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ from .errors import GitwsError
 from .git import (
     common_git_dir,
     ensure_clean,
+    ensure_removable,
     ensure_repo,
     run_git,
     submodule_is_optional,
@@ -143,7 +146,10 @@ class Store:
         """Explicitly switch a clean original checkout; None selects remote latest."""
         command = "sync" if revision is None else "switch"
         if repo.path is None:
-            raise GitwsError(f"{command} requires a local repository")
+            raise GitwsError(
+                f"{command} changes the original checkout and requires a local source; "
+                "for a URL source, new already fetches updates"
+            )
         if revision is None and not repo.remote:
             raise GitwsError("local repository has no origin URL")
         with self.locked(f"repo:{repo.mirror}"):
@@ -197,7 +203,7 @@ class Store:
                         incomplete = True
                         break
             if incomplete:
-                if repo.source == "local":
+                if repo.path is not None:
                     self.seed_local_lfs(repo.path, self.lfs_path(repo))
                 self.cache.update_submodules(base, env, repo.path, repo.source == "local")
                 if repo.source == "remote":
@@ -206,7 +212,7 @@ class Store:
                     lfs.checkout(base, self.lfs_path(repo))
             return base
         base.parent.mkdir(parents=True, exist_ok=True)
-        if repo.source == "local":
+        if repo.path is not None:
             self.seed_local_lfs(repo.path, self.lfs_path(repo))
         run_git("worktree", "add", "--detach", str(base), commit, cwd=repo.mirror, env=env)
         try:
@@ -258,8 +264,12 @@ class Store:
         return values
 
     def create_workspace(
-        self, repo: Repo, name: str, commit: str | None, cow: bool = False
+        self, repo: Repo, name: str, commit: str | None, cow: bool = False, *, latest: bool = False
     ) -> WorkspaceRecord:
+        if latest and commit is not None:
+            raise GitwsError("--latest cannot be combined with --at")
+        if latest and not repo.remote:
+            raise GitwsError("--latest requires an origin URL")
         with self.locked(f"workspace:{name}"), self.locked(f"repo:{repo.mirror}"):
             if not name or "/" in name or name in {".", ".."}:
                 raise GitwsError("workspace name must be a simple name")
@@ -268,7 +278,11 @@ class Store:
             if record.exists() or target.exists():
                 raise GitwsError(f"workspace already exists: {name}")
             self.sync_mirror(repo)
-            revision = commit or self.cache.latest(repo)
+            revision = (
+                self.cache.sync_remote(repo)
+                if latest and repo.source == "local"
+                else commit or self.cache.latest(repo)
+            )
             try:
                 commit = self.cache.resolve_commit(repo, revision)
             except GitwsError:
@@ -293,8 +307,12 @@ class Store:
             target.parent.mkdir(parents=True, exist_ok=True)
             lfs_storage = self.lfs_path(repo)
             lfs_env = lfs.environment()
-            if repo.source == "local" and not cow:
+            if repo.path is not None and not cow:
                 self.seed_local_lfs(repo.path, lfs_storage)
+            if latest:
+                # Allow upstream submodule/LFS transfers for this creation only.
+                # Keep the alias, mirror, source path and cache identities intact.
+                repo = replace(repo, source="remote")
             if cow:
                 return self._create_cow_workspace(repo, name, commit, lfs_storage, lfs_env)
             return self._create_worktree_workspace(repo, name, commit, lfs_storage, lfs_env)
@@ -385,13 +403,32 @@ class Store:
             with self.locked(f"repo:{mirror}"):
                 yield item, mirror
 
-    def remove_workspace(self, name: str) -> None:
+    def _available_path(self, item: WorkspaceRecord) -> Path:
+        target = Path(item["path"])
+        if not target.is_dir():
+            raise GitwsError(f"workspace directory is missing: {target}")
+        if item.get("mode") == "cow" and not self.is_mounted(target):
+            command = shlex.join(["gitws", "--home", str(self.root), "mount", item["name"]])
+            raise GitwsError(f"workspace is not mounted: {item['name']}; run {command}")
+        if ensure_repo(target) != target.resolve():
+            raise GitwsError(f"workspace is not a Git checkout: {target}")
+        return target
+
+    def workspace_path(self, name: str) -> Path:
+        with self.workspace_locked(name) as (item, _):
+            return self._available_path(item)
+
+    def remove_workspace(self, name: str, force: bool = False) -> None:
         with self.workspace_locked(name) as (item, mirror):
             record = self.record_path(name)
             repo = self.get(item["repo"])
             target = Path(item["path"]).resolve()
             if self.workspaces_dir not in target.parents:
                 raise GitwsError("refusing to remove a path outside gitws workspaces")
+            if not force:
+                ensure_removable(
+                    self._available_path(item), protect_submodule_objects=item.get("mode") != "cow"
+                )
             if item.get("mode") == "cow":
                 overlay.unmount(target)
                 overlay.remove_metadata(Path(item["base"]), target)

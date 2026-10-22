@@ -119,7 +119,17 @@ class RepositoryCache:
                 elif not mirror.exists():
                     raise GitwsError(f"local submodule is unavailable: {local_path}")
             elif not mirror.exists():
-                run_git("clone", "--mirror", url, str(mirror))
+                if local_path and (local_path / ".git").exists():
+                    run_git(
+                        "clone",
+                        "--mirror",
+                        local_clone_option(local_path),
+                        str(local_path),
+                        str(mirror),
+                        env=lfs.environment(),
+                    )
+                else:
+                    run_git("clone", "--mirror", url, str(mirror))
             else:
                 run_git(
                     "fetch",
@@ -292,13 +302,14 @@ class RepositoryCache:
         raise GitwsError(f"unknown commit: {revision}")
 
     def sync_remote(self, repo: Repo) -> str:
-        if not repo.remote or not repo.branch:
-            raise GitwsError("repository has no configured remote branch")
+        if not repo.remote:
+            raise GitwsError("repository has no origin URL")
         with self.locked(f"mirror:{repo.mirror}"):
             run_git(
                 "fetch",
+                "--no-tags",
                 absolute_remote(repo.remote, repo.path),
-                f"+refs/heads/{repo.branch}:refs/gitws/remote-head",
+                "+HEAD:refs/gitws/remote-head",
                 cwd=repo.mirror,
             )
             return run_git("rev-parse", "refs/gitws/remote-head", cwd=repo.mirror)

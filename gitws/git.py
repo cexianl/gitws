@@ -43,6 +43,51 @@ def ensure_clean(path: Path) -> None:
             raise GitwsError(f"submodule is not at the recorded clean commit: {line}")
 
 
+def has_private_objects(path: Path) -> bool:
+    counts = dict(
+        line.split(": ", 1)
+        for line in run_git("count-objects", "-v", cwd=path).splitlines()
+        if ": " in line
+    )
+    return bool(int(counts.get("count", 0)) or int(counts.get("in-pack", 0)))
+
+
+def ensure_removable(path: Path, *, protect_submodule_objects: bool = True) -> None:
+    """Protect worktree files, including ignored files in nested submodules."""
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        entries = run_git("ls-files", "-v", "-z", cwd=current).split("\0")
+        if any(entry and (entry[0].islower() or entry[0] == "S") for entry in entries):
+            raise GitwsError(
+                f"workspace has assume-unchanged or skip-worktree entries: {current}; "
+                "inspect them before using remove --force"
+            )
+        status = run_git(
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+            cwd=current,
+        )
+        if status:
+            raise GitwsError(
+                f"workspace has local changes, untracked or ignored files: {current}; "
+                "use remove --force to discard them"
+            )
+        if protect_submodule_objects and current != path and has_private_objects(current):
+            raise GitwsError(
+                f"submodule has private Git objects: {current}; "
+                "preserve needed commits before using remove --force"
+            )
+        pending.extend(
+            current / subpath
+            for subpath in submodule_urls(current)
+            if (current / subpath / ".git").exists()
+        )
+
+
 def submodule_snapshot(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     output = run_git("submodule", "status", "--recursive", cwd=path)

@@ -35,25 +35,61 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("source")
 
-    p = sub.add_parser("sync", help="switch the registered checkout to remote latest")
+    p = sub.add_parser(
+        "sync",
+        help="switch the original checkout to the remote default branch",
+        description="Switch a clean original local checkout to the remote default branch. "
+        "To create a task there without switching the original, use new --latest. "
+        "URL sources fetch automatically during new.",
+    )
     p.add_argument("name")
-    p = sub.add_parser("switch", help="switch the registered checkout to a commit")
+    p = sub.add_parser(
+        "switch",
+        help="switch the original checkout to a commit",
+        description="Switch a clean original local checkout to a specific commit. "
+        "Existing task workspaces keep their own commits.",
+    )
     p.add_argument("name")
     p.add_argument("commit")
 
-    p = sub.add_parser("new", help="create an isolated workspace")
+    p = sub.add_parser(
+        "new",
+        help="create an isolated workspace",
+        description="Local sources default to local HEAD without remote access. "
+        "URL sources fetch the remote default branch. --latest uses the upstream "
+        "default branch while preserving the original checkout and existing tasks.",
+    )
     p.add_argument("name")
     p.add_argument("workspace")
-    p.add_argument("--at", dest="commit")
+    revision = p.add_mutually_exclusive_group()
+    revision.add_argument("--at", dest="commit", help="start at a specified commit")
+    revision.add_argument(
+        "--latest",
+        action="store_true",
+        help="fetch the upstream default branch into shared storage",
+    )
     p.add_argument("--cow", action="store_true", help="use a copy-on-write OverlayFS workspace")
 
     sub.add_parser("list", help="list repositories and workspaces")
     p = sub.add_parser("status", help="show repository and workspace status")
     p.add_argument("name", nargs="?", help="repository alias")
-    p = sub.add_parser("path", help="print a workspace path")
+    p = sub.add_parser(
+        "path",
+        help="print a usable workspace path",
+        description="Print the path of an available workspace. Missing directories "
+        "and unmounted COW workspaces fail; restore a COW workspace with mount first.",
+    )
     p.add_argument("workspace")
-    p = sub.add_parser("remove", help="remove a workspace")
+    p = sub.add_parser(
+        "remove",
+        help="remove a workspace; refuse local or ignored files",
+        description="Refuse modified, untracked or ignored files, including in submodules. "
+        "Also protect hidden index entries and ordinary submodules' private Git objects. "
+        "Mount COW workspaces before checking them. --force discards workspace files "
+        "without these checks; preserve needed commits before removal.",
+    )
     p.add_argument("workspace")
+    p.add_argument("--force", action="store_true", help="discard all workspace files and edits")
     p = sub.add_parser("mount", help="restore a COW workspace mount")
     p.add_argument("workspace")
     p = sub.add_parser("usage", help="show repository disk usage")
@@ -154,13 +190,10 @@ def _execute(store: Store, args: argparse.Namespace) -> None:
         _show_status(store, args.name)
         return
     if args.command == "path":
-        item = next((item for item in store.workspaces() if item["name"] == args.workspace), None)
-        if item is None:
-            raise GitwsError(f"unknown workspace: {args.workspace}")
-        print(item["path"])
+        print(store.workspace_path(args.workspace))
         return
     if args.command == "remove":
-        store.remove_workspace(args.workspace)
+        store.remove_workspace(args.workspace, force=args.force)
         print(f"removed {args.workspace}")
         return
     if args.command == "mount":
@@ -173,7 +206,9 @@ def _execute(store: Store, args: argparse.Namespace) -> None:
     elif args.command == "switch":
         print(store.switch_source(repo, args.commit))
     elif args.command == "new":
-        item = store.create_workspace(repo, args.workspace, args.commit, args.cow)
+        item = store.create_workspace(
+            repo, args.workspace, args.commit, args.cow, latest=args.latest
+        )
         print(item["path"])
     elif args.command == "usage":
         _show_usage(store, repo, args.bytes)

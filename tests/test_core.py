@@ -32,6 +32,7 @@ class GitwsTests(unittest.TestCase):
         run_git("commit", "-m", "one", cwd=self.source)
         run_git("remote", "add", "origin", str(self.remote), cwd=self.source)
         run_git("push", "-u", "origin", "main", cwd=self.source)
+        run_git("symbolic-ref", "HEAD", "refs/heads/main", cwd=self.remote)
         self.store = Store(self.root / "state")
 
     def tearDown(self):
@@ -271,7 +272,7 @@ class GitwsTests(unittest.TestCase):
             (submodule_path / "lib.txt").write_text("changed\n")
             self.assertEqual("shared\n", (Path(first["path"]) / "modules/lib/lib.txt").read_text())
         finally:
-            self.store.remove_workspace("cow-submodule")
+            self.store.remove_workspace("cow-submodule", force=True)
 
     def test_workspaces_share_lfs_storage_and_plain_repo_still_works(self):
         repo = self.store.add("demo", self.source)
@@ -304,7 +305,7 @@ class GitwsTests(unittest.TestCase):
         usage = self.store.usage(repo)
         self.assertTrue(any(key.startswith("shared base:") for key in usage))
         self.assertIn("workspace:cow-one writes", usage)
-        self.store.remove_workspace("cow-one")
+        self.store.remove_workspace("cow-one", force=True)
         self.store.remove_workspace("cow-two")
 
 

@@ -19,10 +19,18 @@ def environment() -> dict[str, str]:
     return env
 
 
+def _configure(path: Path, storage: Path) -> None:
+    # Submodule clones do not inherit their mirror's filter configuration.
+    # Without filters, lfs checkout can succeed while leaving pointer files.
+    # Configure only this repository; preserve any existing hooks.
+    run_git("lfs", "install", "--local", "--skip-repo", cwd=path)
+    run_git("config", "lfs.storage", str(storage), cwd=path)
+
+
 def pull(path: Path, storage: Path) -> None:
     if shutil.which("git-lfs") is None:
         return
-    run_git("config", "lfs.storage", str(storage), cwd=path)
+    _configure(path, storage)
     run_git("lfs", "pull", cwd=path)
     for subpath in submodule_urls(path):
         child = path / subpath
@@ -78,7 +86,7 @@ def _seed(source: Path, storage: Path) -> None:
 def checkout(path: Path, storage: Path) -> None:
     if shutil.which("git-lfs") is None:
         return
-    run_git("config", "lfs.storage", str(storage), cwd=path)
+    _configure(path, storage)
     for line in run_git("lfs", "ls-files", "--long", cwd=path).splitlines():
         object_id = line.split(None, 1)[0]
         if not re.fullmatch(r"[0-9a-f]{64}", object_id):

@@ -35,6 +35,14 @@ git switch -c task-a
 `new --at <commit>` 可指定提交。工作区初始为 detached HEAD，递归子仓库固定到记录的
 commit。之后更新来源仓库不会改变已有工作区。未提交修改、未跟踪文件和构建产物不会从来源目录复制。
 
+本地来源可通过 `new --latest` 将远端默认分支拉取到现有缓存，原始仓库和已有任务不切换提交：
+
+```bash
+gitws new project task-b --latest
+```
+
+此时也允许拉取所需的子仓库和 LFS 数据。`--latest` 与 `--at` 互斥，两者均可搭配 `--cow`。
+
 每个任务使用不同的分支名。工作区的 `origin` 指向登记的上游仓库；本地来源未配置上游时，
 工作区也不设置 `origin`。已有别名不能重新登记为不同的来源。
 
@@ -43,19 +51,25 @@ commit。之后更新来源仓库不会改变已有工作区。未提交修改�
 | 命令 | 用途 |
 | --- | --- |
 | `add <name> <path-or-url>` | 登记仓库别名 |
-| `new <name> <workspace> [--at COMMIT] [--cow]` | 创建工作区 |
-| `path <workspace>` | 输出工作区路径 |
+| `new <name> <workspace> [--at COMMIT \| --latest] [--cow]` | 创建工作区 |
+| `path <workspace>` | 输出工作区路径；目录缺失或未挂载时报错 |
 | `list` | 列出仓库和工作区 |
 | `status [name]` | 查看 commit 和修改状态 |
 | `usage <name> [--bytes]` | 查看磁盘占用 |
-| `remove <workspace>` | 删除工作区，包括其中的本地修改 |
+| `remove <workspace> [--force]` | 删除工作区；`--force` 丢弃本地文件 |
 | `mount <workspace>` | 恢复 COW 挂载，例如重启后恢复工作区 |
 | `doctor <name>` | 检查仓库和工作区完整性 |
 | `clean <name> [--unused] [--dry-run]` | 清理失效记录，可选回收未使用的 COW 基础目录 |
-| `sync <name>` | 将原始仓库切换到远端分支的最新 commit |
+| `sync <name>` | 将原始仓库切换到远端当前默认分支的最新 commit |
 | `switch <name> <commit>` | 将原始仓库切换到指定 commit |
 
 只有 `sync` 和 `switch` 会修改原始仓库；两者仅适用于本地路径来源，存在本地修改时会拒绝执行。
+
+`remove` 遇到修改、未跟踪文件或被忽略的文件时会拒绝删除，也会检查子仓库。
+索引包含 `assume-unchanged`/`skip-worktree` 标记，或普通工作区的子仓库含有会随删除丢失的
+独有 Git 对象时，也会拒绝删除。保留需要的内容后才使用 `--force`。
+未挂载的 COW 工作区应先挂载并检查内容，
+或通过 `--force` 明确丢弃。删除前请保留需要的提交，删除工作区不等于备份。
 
 ## 存储
 

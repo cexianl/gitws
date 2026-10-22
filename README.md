@@ -38,6 +38,16 @@ HEAD and pin recursive submodule commits. Later source updates do not change
 existing workspaces. Uncommitted edits, untracked files, and build outputs are
 not copied from the source.
 
+For a local source, use `new --latest` to fetch the upstream default branch into
+the existing cache without switching the original checkout or existing tasks:
+
+```bash
+gitws new project task-b --latest
+```
+
+This also permits fetching required submodule and LFS data. `--latest` and
+`--at` are mutually exclusive; either can be combined with `--cow`.
+
 Use a different branch name for each task. Workspace `origin` points to the
 registered upstream; local sources without an upstream have no `origin`.
 Registering an existing alias with a different source is rejected.
@@ -47,20 +57,27 @@ Registering an existing alias with a different source is rejected.
 | Command | Purpose |
 | --- | --- |
 | `add <name> <path-or-url>` | Register a repository alias |
-| `new <name> <workspace> [--at COMMIT] [--cow]` | Create a workspace |
-| `path <workspace>` | Print its path |
+| `new <name> <workspace> [--at COMMIT \| --latest] [--cow]` | Create a workspace |
+| `path <workspace>` | Print its path; fail if missing or not mounted |
 | `list` | List repositories and workspaces |
 | `status [name]` | Show commits and local changes |
 | `usage <name> [--bytes]` | Show disk usage |
-| `remove <workspace>` | Remove a workspace, including its local changes |
+| `remove <workspace> [--force]` | Remove a workspace; `--force` discards local files |
 | `mount <workspace>` | Restore a COW mount, for example after a reboot |
 | `doctor <name>` | Check repository and workspace integrity |
 | `clean <name> [--unused] [--dry-run]` | Prune stale records; optionally remove unused COW bases |
-| `sync <name>` | Switch the original checkout to the latest remote branch commit |
+| `sync <name>` | Switch the original checkout to the current remote default branch |
 | `switch <name> <commit>` | Switch the original checkout to a specific commit |
 
 Only `sync` and `switch` modify the original checkout. They require a local
 path source and refuse repositories with local changes.
+
+`remove` refuses modified, untracked, or ignored files, including in submodules.
+It also refuses hidden index entries (`assume-unchanged`/`skip-worktree`) and
+ordinary submodules with private Git objects that would be deleted.
+Use `--force` only after preserving needed work. For an unmounted COW workspace, mount it to
+inspect its contents before removal, or explicitly discard it with `--force`.
+Preserve needed commits before removing a workspace; removal is not a backup.
 
 ## Storage
 

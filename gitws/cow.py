@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .errors import GitwsError
-from .git import run_git, submodule_urls
+from .git import has_private_objects, run_git, submodule_urls
 from .process import run_command
 
 
@@ -125,15 +125,10 @@ def has_private_submodule_data(base: Path) -> bool:
                 continue
             if run_git("worktree", "list", "--porcelain", cwd=child).count("worktree ") > 1:
                 return True
-            counts = dict(
-                line.split(": ", 1)
-                for line in run_git("count-objects", "-v", cwd=child).splitlines()
-                if ": " in line
-            )
             # A reference clone normally has no objects of its own. Keep
             # loose/packed objects, including detached or dangling task
             # commits whose worktree reflog was removed with the workspace.
-            if int(counts.get("count", 0)) or int(counts.get("in-pack", 0)):
+            if has_private_objects(child):
                 return True
             pending.append(child)
     return False
