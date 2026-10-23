@@ -2,11 +2,56 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import unittest
+from pathlib import Path
 
-from tests.support import RepositoryTestCase
+from gitws.git import run_git
+from tests.support import HAS_COW, RepositoryTestCase
 
 
 class ConcurrencyTests(RepositoryTestCase):
+    @unittest.skipUnless(HAS_COW, "fuse-overlayfs is unavailable")
+    def test_parallel_cow_versions_share_files_and_publish_complete_bases(self) -> None:
+        (self.source / "shared").write_bytes(b"common source\n" * 8192)
+        run_git("add", "shared", cwd=self.source)
+        run_git("commit", "-m", "shared", cwd=self.source)
+        first = run_git("rev-parse", "HEAD", cwd=self.source)
+        second = self.commit(self.source)
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "gitws",
+                    "--home",
+                    str(self.store.root),
+                    "new",
+                    "project",
+                    name,
+                    "--cow",
+                    "--at",
+                    commit,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for name, commit in (("a", first), ("b", second))
+        ]
+        try:
+            results = [process.communicate(timeout=30) for process in processes]
+            self.assertEqual([0, 0], [process.returncode for process in processes], results)
+            records = self.store.workspaces()
+            self.assertEqual(2, len(records))
+            a, b = (Path(item["base"]) for item in records)
+            self.assertTrue((a / "shared").samefile(b / "shared"))
+            self.assertEqual([], self.store.doctor(self.repo))
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
     def test_multiple_cli_processes_create_distinct_workspaces(self) -> None:
         processes = [
             subprocess.Popen(

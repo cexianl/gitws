@@ -94,6 +94,18 @@ source tree and stores each workspace's changes separately. It requires
 OverlayFS or `fuse-overlayfs`; use `gitws remove` to unmount and delete it.
 After a reboot, run `gitws mount <workspace>` to restore the tree and its edits.
 
+New COW bases also share regular files with identical content and compatible permissions
+across commits, including recursive submodules and hydrated LFS files. Each version keeps
+a complete directory tree; OverlayFS copies edited files into the task's own write layer.
+Different paths within one tree never become hardlinks merely because their contents match.
+
+Creation checks out and deduplicates bounded batches instead of allocating a full duplicate
+tree first. A single large file or filter output still needs temporary space. Sharing is
+limited to new-format bases in the same repository cache; files remain independent if
+hardlinks are unavailable. Existing bases and workspaces retain their layout without
+automatic migration or source hardlinks to new bases. The first use of the new layout
+requires a new base. Develop in workspaces; do not edit internal base directories directly.
+
 Unused bases remain cached for reuse and are included in `usage`, along with
 submodule mirrors. Preview and reclaim unused bases with:
 
@@ -110,6 +122,19 @@ concurrently; operations on the same repository are serialized.
 `usage` reports file lengths (`logical`) and allocated file blocks (`physical`),
 including build outputs. Hard links count once toward physical usage.
 Results appear row by row; `--bytes` displays exact byte counts.
+
+Base rows also show:
+
+| Field | Meaning |
+| --- | --- |
+| `exclusive` | Allocated file blocks referenced only within this base |
+| `shared` | Allocated file blocks shared with paths outside this base; not additive across rows |
+| `reclaimable` | Estimated exclusive file space released if this base can currently be cleaned; 0 while used or protected |
+| `workspaces` | Workspaces referencing the base, including unmounted ones |
+
+Each row's `physical` is its contribution to the deduplicated total, not the space freed
+by deleting it. `reclaimable` excludes external Git metadata. Cleaning several bases may
+also release shared files, so the per-base estimates are not additive.
 
 ## Compared with `git worktree`
 

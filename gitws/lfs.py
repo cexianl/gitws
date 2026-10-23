@@ -87,6 +87,25 @@ def checkout(path: Path, storage: Path) -> None:
     if shutil.which("git-lfs") is None:
         return
     _configure(path, storage)
+    _verify_objects(path, storage)
+    run_git("lfs", "checkout", cwd=path)
+    for subpath in submodule_urls(path):
+        child = path / subpath
+        if child.is_dir():
+            checkout(child, storage)
+
+
+def prepare(path: Path, storage: Path, *, local_only: bool) -> None:
+    """Prepare one repository's filters and objects without writing source files."""
+    if shutil.which("git-lfs") is None:
+        return
+    _configure(path, storage)
+    if not local_only:
+        run_git("lfs", "fetch", "origin", "HEAD", cwd=path)
+    _verify_objects(path, storage)
+
+
+def _verify_objects(path: Path, storage: Path) -> None:
     for line in run_git("lfs", "ls-files", "--long", cwd=path).splitlines():
         object_id = line.split(None, 1)[0]
         if not re.fullmatch(r"[0-9a-f]{64}", object_id):
@@ -94,8 +113,3 @@ def checkout(path: Path, storage: Path) -> None:
         object_path = storage / "objects" / object_id[:2] / object_id[2:4] / object_id
         if not object_path.exists():
             raise GitwsError(f"local Git LFS object is missing: {object_id}")
-    run_git("lfs", "checkout", cwd=path)
-    for subpath in submodule_urls(path):
-        child = path / subpath
-        if child.is_dir():
-            checkout(child, storage)

@@ -175,7 +175,13 @@ def _show_usage(store: Store, repo: Repo, raw_bytes: bool) -> None:
         logical = format_size(value["logical"])
         physical = format_size(value["physical"])
         label = key.removeprefix("workspace:")
-        print(f"{label}\tlogical={logical}\tphysical={physical}", flush=True)
+        fields = [label, f"logical={logical}", f"physical={physical}"]
+        for field in ("exclusive", "shared", "reclaimable"):
+            if field in value:
+                fields.append(f"{field}={format_size(value[field])}")
+        if "workspaces" in value:
+            fields.append(f"workspaces={value['workspaces']}")
+        print("\t".join(fields), flush=True)
 
 
 def _execute(store: Store, args: argparse.Namespace) -> None:

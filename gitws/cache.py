@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -171,9 +171,13 @@ class RepositoryCache:
         env: dict[str, str] | None = None,
         source_path: Path | None = None,
         local_only: bool = False,
+        *,
+        checkout: Callable[[Path], None] | None = None,
     ) -> None:
         run_git("submodule", "sync", "--recursive", cwd=path, env=env)
-        self._update_submodule_tree(path, env, source_path, local_only, common_git_dir(path))
+        self._update_submodule_tree(
+            path, env, source_path, local_only, common_git_dir(path), checkout
+        )
 
     def remember_submodule(self, owner: Path, mirror: Path) -> None:
         if owner.parent != self.repos_dir:
@@ -213,6 +217,7 @@ class RepositoryCache:
         source_path: Path | None = None,
         local_only: bool = False,
         owner: Path | None = None,
+        checkout: Callable[[Path], None] | None = None,
     ) -> None:
         # Initialize one child at a time so each clone gets its own mirror as
         # an explicit alternates/reference store. Nested .gitmodules become
@@ -248,6 +253,29 @@ class RepositoryCache:
             if owner:
                 self.remember_submodule(owner, mirror)
             child = path / subpath
+            if checkout is not None:
+                # Initialize private metadata without allocating a complete
+                # checkout before bounded materialization and deduplication.
+                if (child / ".git").exists():
+                    raise GitwsError(f"shared base submodule already exists: {child}")
+                run_git(
+                    "-c",
+                    "protocol.file.allow=always",
+                    "clone",
+                    "--no-checkout",
+                    "--reference",
+                    str(mirror),
+                    mirror.as_uri(),
+                    str(child),
+                    cwd=path,
+                    env=env,
+                )
+                run_git("submodule", "absorbgitdirs", "--", subpath, cwd=path, env=env)
+                run_git("reset", "--mixed", "--quiet", commit, cwd=child, env=env)
+                run_git("remote", "set-url", "origin", url, cwd=child)
+                checkout(child)
+                self._update_submodule_tree(child, env, local_child, local_only, owner, checkout)
+                continue
             if (child / ".git").exists() and not run_git(
                 "rev-parse",
                 "--verify",

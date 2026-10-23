@@ -24,7 +24,7 @@ def prepare_metadata(base: Path, target: Path, upper: Path, storage: Path) -> No
         run_git("rev-parse", "HEAD", cwd=base),
         cwd=base,
     )
-    run_git("reset", "--mixed", "HEAD", cwd=target)
+    run_git("reset", "--mixed", "--quiet", "HEAD", cwd=target)
     run_git("config", "lfs.storage", str(storage), cwd=target)
     metadata = target / ".git"
     destination = upper / ".git"
@@ -53,7 +53,7 @@ def _prepare_children(base: Path, target: Path, upper: Path, storage: Path) -> N
             commit,
             cwd=base_child,
         )
-        run_git("reset", "--mixed", "HEAD", cwd=target_child)
+        run_git("reset", "--mixed", "--quiet", "HEAD", cwd=target_child)
         run_git("config", "lfs.storage", str(storage), cwd=target_child)
         child_metadata = target_child / ".git"
         child_destination = upper / subpath / ".git"

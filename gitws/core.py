@@ -16,8 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from . import checkout, lfs
 from . import cow as overlay
-from . import lfs
 from .cache import RepositoryCache
 from .errors import GitwsError
 from .git import (
@@ -169,17 +169,18 @@ class Store:
         return self.records_dir / f"{name}.json"
 
     def base_path(self, repo: Repo, commit: str) -> Path:
-        legacy = self.bases_dir / storage_id(repo) / commit
-        if legacy.is_dir():
-            try:
-                if common_git_dir(legacy) == repo.mirror:
-                    return legacy
-            except GitwsError:
-                pass
-        return self.bases_dir / repo.mirror.stem / commit
+        # Existing base trees can be mounted and mutable under older releases.
+        # Only new-format bases are eligible for source-file hardlink sharing.
+        return self.bases_dir / repo.mirror.stem / "shared" / commit
 
     def retained_bases(self, repo: Repo) -> list[Path]:
-        values = {path for path in (self.bases_dir / repo.mirror.stem).glob("*") if path.is_dir()}
+        directory = self.bases_dir / repo.mirror.stem
+        values = {path for path in directory.glob("*") if path.is_dir() and path.name != "shared"}
+        values.update(
+            path
+            for path in (directory / "shared").glob("*")
+            if path.is_dir() and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", path.name)
+        )
         for path in (self.bases_dir / storage_id(repo)).glob("*"):
             if path.is_dir():
                 try:
@@ -195,33 +196,38 @@ class Store:
     def _ensure_base(self, repo: Repo, commit: str, env: dict[str, str]) -> Path:
         base = self.base_path(repo, commit)
         if base.is_dir():
-            incomplete = False
-            for line in run_git("submodule", "status", "--recursive", cwd=base).splitlines():
-                parts = line[1:].split() if line else []
-                if line and line[0] == "-" and len(parts) >= 2:
-                    if not submodule_is_optional(base, parts[1]):
-                        incomplete = True
-                        break
-            if incomplete:
-                if repo.path is not None:
-                    self.seed_local_lfs(repo.path, self.lfs_path(repo))
-                self.cache.update_submodules(base, env, repo.path, repo.source == "local")
-                if repo.source == "remote":
-                    lfs.pull(base, self.lfs_path(repo))
-                else:
-                    lfs.checkout(base, self.lfs_path(repo))
+            if not checkout.complete(base):
+                raise GitwsError(
+                    f"COW base is incomplete: {base}; inspect it before clean --unused"
+                )
             return base
         base.parent.mkdir(parents=True, exist_ok=True)
         if repo.path is not None:
             self.seed_local_lfs(repo.path, self.lfs_path(repo))
-        run_git("worktree", "add", "--detach", str(base), commit, cwd=repo.mirror, env=env)
+        run_git(
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            str(base),
+            commit,
+            cwd=repo.mirror,
+            env=env,
+        )
         try:
-            self.cache.update_submodules(base, env, repo.path, repo.source == "local")
-            run_git("config", "lfs.storage", str(self.lfs_path(repo)), cwd=base)
-            if repo.source == "remote":
-                lfs.pull(base, self.lfs_path(repo))
-            else:
-                lfs.checkout(base, self.lfs_path(repo))
+            with checkout.SharedCheckout(base) as shared:
+                run_git("reset", "--mixed", "--quiet", "HEAD", cwd=base, env=env)
+                materialize_env = {**env, "GIT_LFS_SKIP_SMUDGE": "0"}
+
+                def materialize(path: Path) -> None:
+                    lfs.prepare(path, self.lfs_path(repo), local_only=repo.source == "local")
+                    shared.checkout(path, materialize_env)
+
+                materialize(base)
+                self.cache.update_submodules(
+                    base, env, repo.path, repo.source == "local", checkout=materialize
+                )
+                shared.publish()
             return base
         except Exception:
             run_git("worktree", "remove", "--force", str(base), cwd=repo.mirror, check=False)
@@ -445,6 +451,19 @@ class Store:
 
     def iter_usage(self, repo: Repo) -> Iterator[tuple[str, DiskUsage]]:
         """Measure each row when requested, without scanning mounted COW trees."""
+        bases = self.retained_bases(repo)
+        labels = {}
+        for base in bases:
+            suffix = (
+                " (legacy)"
+                if (
+                    sum(other.name == base.name for other in bases) > 1
+                    and base.parent != self.bases_dir / repo.mirror.stem / "shared"
+                )
+                else ""
+            )
+            labels[f"shared base:{base.name}{suffix}"] = base
+        records = self.workspaces()
 
         def paths() -> Iterator[tuple[str, Path, bool]]:
             yield "shared Git objects", repo.mirror, False
@@ -453,15 +472,29 @@ class Store:
             yield "shared LFS objects", self.root / "lfs" / storage_id(repo), False
             if repo.path:
                 yield "original checkout", repo.path, True
-            for base in self.retained_bases(repo):
-                yield f"shared base:{base.name}", base, True
+            metadata = self.bases_dir / repo.mirror.stem / "shared" / ".manifests"
+            if metadata.is_dir():
+                yield "base metadata", metadata, False
+            for label, base in labels.items():
+                yield label, base, True
             for item in self.workspaces(repo.name):
                 if item.get("mode") == "cow":
                     yield f"workspace:{item['name']} writes", Path(item["upper"]), True
                 else:
                     yield f"workspace:{item['name']}", Path(item["path"]), True
 
-        yield from measure_paths(paths())
+        for label, value in measure_paths(paths(), detailed=set(bases)):
+            if label in labels:
+                base = labels[label]
+                value["workspaces"] = sum(item.get("base") == str(base) for item in records)
+                value["reclaimable"] = 0
+                if not value["workspaces"] and not self.is_mounted(base):
+                    try:
+                        if not overlay.has_private_submodule_data(base):
+                            value["reclaimable"] = value["exclusive"]
+                    except GitwsError:
+                        pass  # Uncertain metadata must not advertise safe cleanup.
+            yield label, value
 
     def doctor(self, repo: Repo) -> list[str]:
         problems: list[str] = []
@@ -519,6 +552,8 @@ class Store:
                         for cache in self.submodule_caches(repo):
                             self.cache.remember_submodule(repo.mirror, cache)
                         run_git("worktree", "remove", "--force", str(base), cwd=owner)
+                        if base.parent == self.bases_dir / repo.mirror.stem / "shared":
+                            checkout.manifest_path(base).unlink(missing_ok=True)
                     removed.append(base)
             for item in self.workspaces(repo.name):
                 path = Path(item["path"])

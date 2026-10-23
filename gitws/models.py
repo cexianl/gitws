@@ -50,6 +50,13 @@ class WorkspaceRecord(WorkspaceInfo, total=False):
     work: str
 
 
-class DiskUsage(TypedDict):
+class _DiskTotals(TypedDict):
     logical: int
     physical: int
+
+
+class DiskUsage(_DiskTotals, total=False):
+    exclusive: int
+    shared: int
+    reclaimable: int
+    workspaces: int

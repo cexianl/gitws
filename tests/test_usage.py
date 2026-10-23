@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from gitws.cli import main
 from gitws.core import Repo, Store
+from gitws.usage import measure
 
 
 class UsageTests(unittest.TestCase):
@@ -56,6 +57,44 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(obj.stat().st_blocks * 512, rows["shared Git objects"]["physical"])
         self.assertEqual(0, rows["original checkout"]["physical"])
         self.assertEqual(obj.stat().st_size, rows["original checkout"]["logical"])
+
+    def test_base_details_distinguish_external_and_internal_hardlinks(self):
+        other = self.root / "other"
+        other.mkdir()
+        shared = self.source / "shared"
+        shared.write_bytes(b"shared\n")
+        os.link(shared, other / "shared")
+        own = self.source / "own"
+        own.write_bytes(b"own\n")
+        os.link(own, self.source / "own-second-link")
+        value = measure(self.source, set(), details=True)
+        self.assertEqual(shared.stat().st_blocks * 512, value["shared"])
+        self.assertEqual(own.stat().st_blocks * 512, value["exclusive"])
+
+    def test_cli_explains_base_sharing_and_reclaimable_space(self):
+        output = io.StringIO()
+        rows = [
+            (
+                "shared base:abc",
+                {
+                    "logical": 8192,
+                    "physical": 4096,
+                    "exclusive": 4096,
+                    "shared": 4096,
+                    "reclaimable": 0,
+                    "workspaces": 2,
+                },
+            )
+        ]
+        with (
+            patch("gitws.cli.Store", return_value=self.store),
+            patch.object(self.store, "get", return_value=self.repo),
+            patch.object(self.store, "iter_usage", return_value=iter(rows)),
+            patch("sys.stdout", output),
+        ):
+            main(["usage", "project", "--bytes"])
+        for field in ("exclusive=4096", "shared=4096", "reclaimable=0", "workspaces=2"):
+            self.assertIn(field, output.getvalue())
 
     def test_git_directories_are_pruned_but_build_outputs_are_counted(self):
         git = self.source / "module" / ".git"
